@@ -1,0 +1,12 @@
+# Runtime state lives in ~/.flightwall, but guard against a stray local copy.
+.flightwall/
+*.pem
+config.json
+routes.json
+
+__pycache__/
+*.py[cod]
+
+.DS_Store
+*.log
+node_modules/

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>FlightWall</title>
+    <meta name="description" content="Live aircraft around you, on a dot-matrix board." />
+    <meta name="theme-color" content="#05070c" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="FlightWall" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="icons/icon-180.png" />
+    <link rel="icon" href="icons/icon-192.png" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <h1>FlightWall</h1>
+      </div>
+      <div class="chips">
+        <span class="chip" id="locStatus">Locating…</span>
+        <span class="chip"><strong id="count">0</strong>&nbsp;near</span>
+        <span class="chip muted optional" id="sourceChip">…</span>
+      </div>
+      <button class="icon-btn" id="settingsToggle" aria-label="Settings">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+          <path
+            fill="currentColor"
+            d="M12 15.5A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5m7.43-2.53a7.7 7.7 0 0 0 0-1.94l2.03-1.58a.5.5 0 0 0 .12-.62l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.4 7.4 0 0 0-1.68-.97l-.36-2.54a.5.5 0 0 0-.49-.42h-3.84a.5.5 0 0 0-.49.42l-.36 2.54a7.4 7.4 0 0 0-1.68.97l-2.39-.96a.5.5 0 0 0-.6.22L2.42 8.83a.5.5 0 0 0 .12.62l2.03 1.58a7.7 7.7 0 0 0 0 1.94l-2.03 1.58a.5.5 0 0 0-.12.62l1.92 3.32a.5.5 0 0 0 .6.22l2.39-.96a7.4 7.4 0 0 0 1.68.97l.36 2.54a.5.5 0 0 0 .49.42h3.84a.5.5 0 0 0 .49-.42l.36-2.54a7.4 7.4 0 0 0 1.68-.97l2.39.96a.5.5 0 0 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.62Z"
+          />
+        </svg>
+      </button>
+    </header>
+
+    <p class="banner" id="banner"></p>
+
+    <main>
+      <section class="panel-wrap">
+        <canvas id="board" aria-label="Dot matrix board showing the selected aircraft"></canvas>
+      </section>
+
+      <section class="scope">
+        <canvas id="radar" aria-label="Radar view of nearby aircraft"></canvas>
+        <div class="scope-legend">
+          <span><i style="background:#35e0d0"></i>Airliner</span>
+          <span><i style="background:#5df08a"></i>General</span>
+          <span><i style="background:#c98bff"></i>Helicopter</span>
+          <span><i style="background:#ffb225"></i>Military</span>
+        </div>
+      </section>
+
+      <section class="listing">
+        <h2>Nearby</h2>
+        <div id="list" class="list"></div>
+      </section>
+    </main>
+
+    <aside class="settings" id="settings">
+      <h2>Settings</h2>
+
+      <label class="field">
+        <span>Board shows</span>
+        <select id="focusMode">
+          <option value="cycle">Cycle through nearby</option>
+          <option value="nearest">Closest aircraft</option>
+          <option value="pinned">Whatever I tap</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>Units</span>
+        <select id="units">
+          <option value="imperial">mph / miles / feet</option>
+          <option value="aviation">knots / nm / feet</option>
+          <option value="metric">km/h / km / metres</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>Search radius <b id="radiusValue">60 NM</b></span>
+        <input type="range" id="radius" min="5" max="250" step="5" />
+      </label>
+
+      <fieldset class="filters">
+        <legend>Show</legend>
+        <label><input type="checkbox" data-filter="commercial" /> Airliners</label>
+        <label><input type="checkbox" data-filter="general" /> General aviation</label>
+        <label><input type="checkbox" data-filter="helicopter" /> Helicopters</label>
+        <label><input type="checkbox" data-filter="military" /> Military</label>
+        <label><input type="checkbox" data-filter="ground" /> Ground vehicles</label>
+      </fieldset>
+
+      <label class="toggle"><input type="checkbox" id="keepAwake" /> Keep the screen awake</label>
+
+      <button class="ghost-btn" id="manualBtn">Set location manually</button>
+
+      <p class="fineprint">
+        Positions come from volunteer ADS-B receivers via adsb.lol, adsb.fi and airplanes.live.
+        Coverage is best above a few thousand feet; aircraft without ADS-B will not appear.
+      </p>
+    </aside>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
