@@ -91,6 +91,18 @@ case "$METHOD" in
       fi
       die "tailscale serve failed (exit $serve_rc). See the output above."
     fi
+
+    # Tailscale can register the proxy and still exit 0 while telling you the
+    # feature is not enabled for the tailnet. The laptop looks fine; the phone
+    # then gets a TLS error, which is a confusing place to discover it.
+    if grep -qi "not enabled on your tailnet" "$serve_log"; then
+      echo
+      echo "  NOTE: tailscale reported that Serve is not enabled for this tailnet."
+      echo "  The proxy is registered, but the certificate may not issue and the"
+      echo "  phone would see a TLS error. If that happens, open the enablement"
+      echo "  link printed above, and confirm MagicDNS and HTTPS Certificates are"
+      echo "  on at https://login.tailscale.com/admin/dns - then just reload."
+    fi
     rm -f "$serve_log"
 
     HOST="$("$TS" status --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["Self"]["DNSName"].rstrip("."))')"
