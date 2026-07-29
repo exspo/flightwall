@@ -23,6 +23,29 @@ token() {
   python3 -c "import json,pathlib;print(json.loads((pathlib.Path('$STATE')/'config.json').read_text())['token'])" 2>/dev/null || true
 }
 
+# The Mac App Store build keeps its CLI inside the app bundle rather than on
+# PATH, so a plain `command -v tailscale` reports "not installed" on a machine
+# that is already connected. Check the usual places too.
+find_tailscale() {
+  local candidate
+  for candidate in \
+    tailscale \
+    /usr/local/bin/tailscale \
+    /opt/homebrew/bin/tailscale \
+    /Applications/Tailscale.app/Contents/MacOS/Tailscale \
+    "$HOME/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+  do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      command -v "$candidate"
+      return 0
+    fi
+    [[ -x "$candidate" ]] && { echo "$candidate"; return 0; }
+  done
+  return 1
+}
+
+TS="$(find_tailscale || true)"
+
 curl -fsS --max-time 2 "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 \
   || die "nothing is listening on port $PORT. Run ./scripts/install.sh first."
 
@@ -31,7 +54,7 @@ SUFFIX=""
 [[ -n "$TOKEN" ]] && SUFFIX="/?k=$TOKEN"
 
 if [[ "$METHOD" == "auto" ]]; then
-  if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
+  if [[ -n "$TS" ]] && "$TS" status >/dev/null 2>&1; then
     METHOD=tailscale
   elif command -v cloudflared >/dev/null 2>&1; then
     METHOD=cloudflare
@@ -45,17 +68,29 @@ case "$METHOD" in
     # Best option for an always-on laptop: a stable hostname with a real
     # Let's Encrypt certificate, reachable from cellular, private to your
     # own devices, and it survives reboots.
+    [[ -n "$TS" ]] || die "the tailscale CLI was not found. If you installed the Mac App Store version, open Tailscale and choose 'Install CLI', or: brew install --cask tailscale"
+    "$TS" status >/dev/null 2>&1 || die "tailscale is installed but not logged in. Run: $TS up"
+
     say "publishing through Tailscale"
-    tailscale serve --bg --https=443 "http://127.0.0.1:$PORT" >/dev/null
-    HOST="$(tailscale status --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["Self"]["DNSName"].rstrip("."))')"
+    if ! serve_error="$("$TS" serve --bg --https=443 "http://127.0.0.1:$PORT" 2>&1)"; then
+      # Almost always the tailnet-wide toggle rather than anything local.
+      if grep -qi "cert\|HTTPS\|not enabled\|MagicDNS" <<<"$serve_error"; then
+        die "Tailscale refused to issue a certificate. Enable MagicDNS *and* HTTPS Certificates for the tailnet at https://login.tailscale.com/admin/dns then re-run. Original error: $serve_error"
+      fi
+      die "tailscale serve failed: $serve_error"
+    fi
+
+    HOST="$("$TS" status --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["Self"]["DNSName"].rstrip("."))')"
+    [[ -n "$HOST" ]] || die "could not read this machine's tailnet hostname"
     echo
     echo "  Open this on your phone (once), then Share -> Add to Home Screen:"
     echo
     echo "    https://$HOST$SUFFIX"
     echo
-    echo "  Your phone must be signed in to the same tailnet. This URL is stable,"
-    echo "  so the home-screen icon keeps working after reboots."
-    echo "  To stop:  tailscale serve --https=443 off"
+    echo "  Your phone needs the Tailscale app, signed in to the same tailnet and"
+    echo "  connected. This URL is stable and the serve config persists across"
+    echo "  reboots, so the home-screen icon keeps working."
+    echo "  To stop:  $TS serve --https=443 off"
     ;;
 
   cloudflare)
@@ -91,9 +126,12 @@ No HTTPS method is available yet. Pick one:
 
   Tailscale (recommended for an always-on laptop)
       brew install --cask tailscale
-      # sign in on the laptop and the phone, then:
+      # sign in on the laptop and the phone, then enable MagicDNS and
+      # HTTPS Certificates at https://login.tailscale.com/admin/dns
       ./scripts/expose.sh tailscale
     Stable private hostname, real certificate, works over cellular.
+    Already have the Mac App Store build? Open Tailscale and choose
+    "Install CLI" so the command is on PATH, then re-run this.
 
   Cloudflare quick tunnel (fastest to try, no account)
       brew install cloudflared
