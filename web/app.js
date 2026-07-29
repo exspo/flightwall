@@ -48,6 +48,7 @@ const DEFAULT_SETTINGS = {
   focus: "cycle", // nearest | cycle | pinned
   keepAwake: true,
   minAlt: 0,
+  headingUp: false,
 };
 
 const state = {
@@ -194,6 +195,114 @@ function subtitleOf(ac) {
 function colorOf(ac) {
   if (ac.emergency) return C.RED;
   return CLASS_COLOR[ac.class] ?? C.WHITE;
+}
+
+// ------------------------------------------------------------------- compass
+
+const compass = {
+  enabled: false,     // user wants heading-up
+  live: false,        // listeners attached and events arriving
+  heading: null,      // smoothed, degrees clockwise from true north
+  accuracy: null,     // iOS only; negative means uncalibrated
+  warned: false,
+};
+
+/** Shortest-path angular smoothing. Averaging 359 and 1 linearly gives 180,
+ *  which would swing the whole scope around every time you face north. */
+function smoothAngle(previous, next, factor) {
+  if (previous === null) return next;
+  const delta = ((next - previous + 540) % 360) - 180;
+  return (previous + factor * delta + 360) % 360;
+}
+
+function onOrientation(event) {
+  let heading = null;
+  if (typeof event.webkitCompassHeading === "number" && !Number.isNaN(event.webkitCompassHeading)) {
+    // iOS: already degrees clockwise from north.
+    heading = event.webkitCompassHeading;
+    if (typeof event.webkitCompassAccuracy === "number") compass.accuracy = event.webkitCompassAccuracy;
+  } else if (event.absolute && typeof event.alpha === "number") {
+    // Spec alpha runs anticlockwise from north, so it has to be inverted.
+    heading = (360 - event.alpha) % 360;
+  }
+  if (heading === null || Number.isNaN(heading)) return;
+
+  if (!compass.live) {
+    compass.live = true;
+    syncCompassButton(); // drops the "waiting" label the moment data arrives
+  }
+  compass.heading = smoothAngle(compass.heading, heading, 0.18);
+
+  // A negative accuracy means iOS does not trust the reading yet.
+  if (!compass.warned && compass.accuracy !== null && compass.accuracy < 0) {
+    compass.warned = true;
+    showBanner("Compass needs calibrating — wave the phone in a figure eight.");
+  }
+}
+
+function attachOrientation() {
+  window.addEventListener("deviceorientationabsolute", onOrientation, true);
+  window.addEventListener("deviceorientation", onOrientation, true);
+}
+
+/**
+ * iOS 13+ only delivers orientation events after an explicit grant, and the
+ * request must come from a user gesture — so this is always called from a tap.
+ */
+async function enableCompass() {
+  const DOE = window.DeviceOrientationEvent;
+  if (!DOE) {
+    showBanner("This device does not report a compass heading.", true);
+    return false;
+  }
+  if (typeof DOE.requestPermission === "function") {
+    let outcome;
+    try {
+      outcome = await DOE.requestPermission();
+    } catch {
+      // Thrown when there is no user activation, which is recoverable: the
+      // next tap on the button will have it.
+      showBanner("Tap the orientation button again to allow compass access.", true);
+      return false;
+    }
+    if (outcome !== "granted") {
+      showBanner(
+        "Compass access was denied. Allow Motion & Orientation for this site in " +
+          "Settings → Apps → Safari, then try again.",
+        true
+      );
+      return false;
+    }
+  }
+  attachOrientation();
+  return true;
+}
+
+/** Degrees the scope is rotated by. Zero means north-up. */
+function headingUp() {
+  return compass.enabled && compass.live && compass.heading !== null ? compass.heading : 0;
+}
+
+async function setCompassEnabled(on) {
+  if (on && !compass.live) {
+    if (!(await enableCompass())) return;
+  }
+  compass.enabled = on;
+  state.settings.headingUp = on;
+  saveSettings();
+  syncCompassButton();
+}
+
+function syncCompassButton() {
+  const button = el("orientBtn");
+  const active = compass.enabled;
+  button.setAttribute("aria-pressed", String(active));
+  button.classList.toggle("active", active);
+  button.textContent = !active
+    ? "North up"
+    : compass.live
+    ? "Heading up"
+    : "Waiting for compass…";
 }
 
 // ------------------------------------------------------------------ location
@@ -370,18 +479,20 @@ function drawBadge(frame, ac) {
   const cx = BADGE.x + 12;
   const cy = BADGE.y + 11;
   const r = 11;
+  const up = headingUp(); // the badge turns with the scope, or they disagree
   frame.circle(cx, cy, r, C.DIM);
+
   // Cardinal ticks, north picked out so the rose is readable at a glance.
-  frame.set(cx, cy - r, C.WHITE);
-  frame.set(cx, cy + r, C.DIM);
-  frame.set(cx - r, cy, C.DIM);
-  frame.set(cx + r, cy, C.DIM);
+  for (const [degrees, color] of [[0, C.WHITE], [90, C.DIM], [180, C.DIM], [270, C.DIM]]) {
+    const rad = ((degrees - up - 90) * Math.PI) / 180;
+    frame.set(Math.round(cx + Math.cos(rad) * r), Math.round(cy + Math.sin(rad) * r), color);
+  }
   frame.set(cx, cy, C.DIM);
   if (!ac) return;
 
   const maxNm = Math.max(1, state.settings.radius);
   const scale = Math.min(1, Math.sqrt(Math.min(ac.dst, maxNm) / maxNm));
-  const rad = ((ac.dir - 90) * Math.PI) / 180;
+  const rad = ((ac.dir - up - 90) * Math.PI) / 180;
   const px = cx + Math.cos(rad) * (r - 2) * scale;
   const py = cy + Math.sin(rad) * (r - 2) * scale;
   frame.line(cx, cy, Math.round(px), Math.round(py), C.DIM);
@@ -484,6 +595,10 @@ function drawRadar() {
   const maxNm = Math.max(1, state.settings.radius);
   const u = unit();
 
+  // How far the whole scope is turned. Every bearing below is drawn relative
+  // to this, so north-up and heading-up share one code path.
+  const up = headingUp();
+
   ctx.strokeStyle = "rgba(122,162,255,0.22)";
   ctx.fillStyle = "rgba(122,162,255,0.55)";
   ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
@@ -493,20 +608,37 @@ function drawRadar() {
     ctx.beginPath();
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
     ctx.stroke();
-    // Inside the ring, offset off the vertical axis, so these never collide
-    // with the N marker or sit on top of the crosshair.
+    // Range labels stay put: they annotate the display, not the ground.
     ctx.fillText(`${Math.round(maxNm * fraction * u.distK)}${u.dist}`, cx + 26, cy - r + 12);
   }
+
+  // The cardinal axes turn with the compass.
   ctx.beginPath();
-  ctx.moveTo(cx - maxR, cy);
-  ctx.lineTo(cx + maxR, cy);
-  ctx.moveTo(cx, cy - maxR);
-  ctx.lineTo(cx, cy + maxR);
+  for (const degrees of [0, 90]) {
+    const rad = ((degrees - up - 90) * Math.PI) / 180;
+    ctx.moveTo(cx - Math.cos(rad) * maxR, cy - Math.sin(rad) * maxR);
+    ctx.lineTo(cx + Math.cos(rad) * maxR, cy + Math.sin(rad) * maxR);
+  }
   ctx.stroke();
 
   ctx.fillStyle = "rgba(242,246,255,0.75)";
-  for (const [label, dx, dy] of [["N", 0, -maxR - 6], ["S", 0, maxR + 12], ["E", maxR + 8, 4], ["W", -maxR - 8, 4]]) {
-    ctx.fillText(label, cx + dx, cy + dy);
+  for (const [label, degrees] of [["N", 0], ["E", 90], ["S", 180], ["W", 270]]) {
+    const rad = ((degrees - up - 90) * Math.PI) / 180;
+    ctx.fillText(label, cx + Math.cos(rad) * (maxR + 9), cy + Math.sin(rad) * (maxR + 9) + 3.5);
+  }
+
+  // When the scope is turning, mark the direction the phone is pointing so
+  // "straight ahead" is unambiguous.
+  if (up) {
+    // Inside the rim: outside it would land on whichever cardinal letter has
+    // rotated to the top.
+    ctx.fillStyle = "rgba(53,224,208,0.9)";
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - maxR + 2);
+    ctx.lineTo(cx - 5, cy - maxR + 12);
+    ctx.lineTo(cx + 5, cy - maxR + 12);
+    ctx.closePath();
+    ctx.fill();
   }
 
   // You, at the middle.
@@ -519,7 +651,7 @@ function drawRadar() {
     // Compress the radial scale so distant traffic stays on the scope while
     // nearby traffic still separates out near the middle.
     const scale = Math.min(1, Math.sqrt(Math.min(ac.dst, maxNm) / maxNm));
-    const rad = ((ac.dir - 90) * Math.PI) / 180;
+    const rad = ((ac.dir - up - 90) * Math.PI) / 180;
     const x = cx + Math.cos(rad) * maxR * scale;
     const y = cy + Math.sin(rad) * maxR * scale;
     const focused = ac.hex === state.focusHex;
@@ -527,7 +659,9 @@ function drawRadar() {
 
     ctx.save();
     ctx.translate(x, y);
-    ctx.rotate((((ac.trk ?? 0) - 90) * Math.PI) / 180);
+    // The aircraft's own track rotates with the scope too, so its nose keeps
+    // pointing where it is actually going.
+    ctx.rotate((((ac.trk ?? 0) - up - 90) * Math.PI) / 180);
     ctx.fillStyle = color;
     ctx.globalAlpha = focused ? 1 : 0.8;
     ctx.beginPath();
@@ -646,9 +780,10 @@ function bindControls() {
     const maxNm = Math.max(1, state.settings.radius);
     let best = null;
     let bestDist = 28;
+    const up = headingUp(); // must match drawRadar, or taps land on the wrong blip
     for (const ac of visibleAircraft()) {
       const scale = Math.min(1, Math.sqrt(Math.min(ac.dst, maxNm) / maxNm));
-      const rad = ((ac.dir - 90) * Math.PI) / 180;
+      const rad = ((ac.dir - up - 90) * Math.PI) / 180;
       const x = cx + Math.cos(rad) * maxR * scale;
       const y = cx + Math.sin(rad) * maxR * scale;
       const d = Math.hypot(x - tapX, y - tapY);
@@ -714,6 +849,14 @@ function bindControls() {
     setPosition(lat, lon, null, "manual");
   });
 
+  // This tap is what supplies the user activation iOS requires before it will
+  // hand over compass events.
+  el("orientBtn").addEventListener("click", () => {
+    // Preference on but no events yet means a grant that needs re-requesting;
+    // that tap should retry rather than switch the preference off.
+    setCompassEnabled(compass.enabled && !compass.live ? true : !compass.enabled);
+  });
+
   el("settingsToggle").addEventListener("click", () => {
     el("settings").classList.toggle("open");
   });
@@ -738,6 +881,31 @@ function syncControls() {
 }
 
 // ------------------------------------------------------------------ start up
+
+/**
+ * Re-arm heading-up on launch. On iOS the grant is remembered, but the
+ * request can still reject without user activation — in that case keep the
+ * preference on and let the button, which does have activation, retry.
+ */
+async function restoreCompass() {
+  if (!state.settings.headingUp || !window.DeviceOrientationEvent) {
+    syncCompassButton();
+    return;
+  }
+  compass.enabled = true;
+  if (typeof window.DeviceOrientationEvent.requestPermission !== "function") {
+    attachOrientation(); // no permission gate on this platform
+  } else {
+    try {
+      if ((await window.DeviceOrientationEvent.requestPermission()) === "granted") {
+        attachOrientation();
+      }
+    } catch {
+      /* needs a tap; the button now reads "Waiting for compass…" */
+    }
+  }
+  syncCompassButton();
+}
 
 async function loadAirlines() {
   try {
@@ -767,6 +935,7 @@ async function main() {
 
   syncControls();
   bindControls();
+  restoreCompass();
   await loadAirlines();
 
   if (state.position) {
