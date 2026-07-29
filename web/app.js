@@ -595,10 +595,16 @@ function boardLines(ac) {
     if (from.location && to.location) line5 += `,${from.location} > ${to.location}`.toUpperCase();
   }
 
+  // The flight number always gets its own line. It used to share a line with
+  // the route, which meant it vanished the moment a route resolved - exactly
+  // when you most want to look the flight up.
+  const identity = ac.flight || ac.reg || ac.hex.toUpperCase();
+  const routeText = route && route.route ? route.route.toUpperCase() : airline ? "NO ROUTE" : typeLabel(ac);
+
   return [
     { text: titleOf(ac), color: C.WHITE, x: TEXT_X, clip: TEXT_CLIP },
-    { text: subtitleOf(ac), color: airline && route ? C.AMBER : C.DIM, x: TEXT_X, clip: TEXT_CLIP },
-    { text: typeLabel(ac), color, x: TEXT_X, clip: TEXT_CLIP },
+    { text: identity, color: C.AMBER, x: TEXT_X, clip: TEXT_CLIP },
+    { text: routeText, color: route && route.route ? color : C.DIM, x: TEXT_X, clip: TEXT_CLIP },
     { text: line3, color: ac.emergency ? C.RED : C.GREEN, x: 0 },
     { text: line4, color: C.GREEN, x: 0 },
     { text: line5, color: C.BLUE, x: 0 },
@@ -867,10 +873,16 @@ function renderList() {
       const route = state.routes.get(ac.flight);
       const color = PALETTE[colorOf(ac)];
       const title = titleOf(ac);
-      const ident = route && route.route ? route.route : ac.flight || ac.reg;
-      // For a private aircraft the title is already the tail number, so
-      // repeating it as the identifier just wastes the line.
-      const sub = [ident === title ? null : ident, typeLabel(ac)].filter(Boolean).join(" · ");
+      // Flight number first. The route used to replace it, which hid the one
+      // identifier you need to look a flight up.
+      const ident = ac.flight || ac.reg;
+      const sub = [
+        ident === title ? null : ident,
+        route && route.route ? route.route : null,
+        typeLabel(ac),
+      ]
+        .filter(Boolean)
+        .join(" · ");
       return `
         <button class="row${ac.hex === state.focusHex ? " active" : ""}" data-hex="${ac.hex}">
           <span class="dot" style="background:${color};box-shadow:0 0 8px ${color}"></span>
@@ -921,6 +933,16 @@ function renderRoute() {
     return;
   }
 
+  // The flight number heads the panel in every case, including when no route
+  // resolves - it is the thing you need to look the flight up elsewhere.
+  const airlineName = airlineOf(ac);
+  const header = `
+    <div class="route-flight">
+      <span class="route-callsign">${escapeHtml(ac.flight || ac.reg || ac.hex.toUpperCase())}</span>
+      ${airlineName ? `<span class="route-airline">${escapeHtml(airlineName.name)}</span>` : ""}
+      ${ac.reg && ac.reg !== ac.flight ? `<span class="route-reg">${escapeHtml(ac.reg)}</span>` : ""}
+    </div>`;
+
   const route = state.routes.get(ac.flight);
   if (route && route.airports && route.airports.length >= 2) {
     const from = route.airports[0];
@@ -928,6 +950,7 @@ function renderRoute() {
     // Three or more airports means an intermediate stop the API knows about.
     const via = route.airports.slice(1, -1);
     container.innerHTML =
+      header +
       routeLeg("From", from) +
       `<div class="route-rule"></div>` +
       (via.length
@@ -941,13 +964,13 @@ function renderRoute() {
   // a private flight has no route to report and never will.
   const airline = airlineOf(ac);
   const message = !airline
-    ? `<b>${escapeHtml(ac.reg || ac.flight || "This aircraft")}</b> is not flying an airline callsign, so there is no filed route to look up.`
+    ? "Flying under a tail number rather than an airline callsign, so there is no filed route to look up."
     : state.routes.has(ac.flight)
     ? `No route on file for <b>${escapeHtml(ac.flight)}</b>.`
     : state.routeError
     ? `Route lookup is unavailable — ${escapeHtml(state.routeError)}. Aircraft data is unaffected.`
     : `Looking up the route for <b>${escapeHtml(ac.flight)}</b>…`;
-  container.innerHTML = `<p class="route-none">${message}</p>`;
+  container.innerHTML = header + `<p class="route-none">${message}</p>`;
 }
 
 /** Move the highlight without rebuilding the list markup - this runs whenever

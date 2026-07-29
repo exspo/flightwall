@@ -196,6 +196,34 @@ main {
   background: var(--panel);
 }
 
+.route-flight {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 9px;
+  padding-bottom: 9px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.route-callsign {
+  font: 17px/1.2 var(--mono);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--text);
+}
+
+.route-airline {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.route-reg {
+  margin-left: auto;
+  font: 11px/1.4 var(--mono);
+  color: var(--muted);
+}
+
 .route-leg {
   display: grid;
   grid-template-columns: 34px 52px 1fr;
