@@ -64,6 +64,8 @@ const state = {
   lastCycle: 0,
   lastFetch: 0,
   lastRouteFetch: 0,
+  routesInFlight: false,
+  routeError: null,
   fetching: false,
   error: null,
   source: null,
@@ -387,14 +389,20 @@ async function refresh(force = false) {
   }
 }
 
-async function fetchRoutes() {
-  if (Date.now() - state.lastRouteFetch < ROUTE_POLL_MS) return;
+/**
+ * @param force skip the poll interval. Used when the board switches to an
+ *        aircraft whose route is not known yet, so selecting something does
+ *        not sit on "Looking up…" for most of a poll cycle.
+ */
+async function fetchRoutes(force = false) {
+  if (!force && Date.now() - state.lastRouteFetch < ROUTE_POLL_MS) return;
   const wanted = state.aircraft
     .filter((ac) => airlineOf(ac) && !state.routes.has(ac.flight))
     .slice(0, 100)
     .map((ac) => ({ callsign: ac.flight, lat: ac.lat, lng: ac.lon }));
-  if (!wanted.length) return;
+  if (!wanted.length || state.routesInFlight) return;
   state.lastRouteFetch = Date.now();
+  state.routesInFlight = true;
   try {
     const res = await fetch("api/routes", {
       method: "POST",
@@ -402,15 +410,21 @@ async function fetchRoutes() {
       credentials: "same-origin",
       body: JSON.stringify({ planes: wanted }),
     });
-    if (!res.ok) return;
-    const { routes } = await res.json();
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const { routes, errors } = await res.json();
     for (const [callsign, route] of Object.entries(routes || {})) {
       state.routes.set(callsign, route);
     }
+    // An upstream failure returns no entry for the callsign, so without this
+    // the UI would claim it is still looking, forever.
+    state.routeError = errors && errors.length ? errors[0] : null;
     renderList();
     renderRoute(); // the focused aircraft's route may have just arrived
-  } catch {
-    /* routes are decoration; never let them break the board */
+  } catch (err) {
+    state.routeError = err.message;
+    renderRoute();
+  } finally {
+    state.routesInFlight = false;
   }
 }
 
@@ -559,6 +573,7 @@ function drawBoard(now) {
     state.focusHex = nextHex;
     syncListHighlight();
     renderRoute();
+    if (ac && airlineOf(ac) && !state.routes.has(ac.flight)) fetchRoutes(true);
   }
   const frame = board.frame;
   frame.clear();
@@ -782,6 +797,8 @@ function renderRoute() {
     ? `<b>${escapeHtml(ac.reg || ac.flight || "This aircraft")}</b> is not flying an airline callsign, so there is no filed route to look up.`
     : state.routes.has(ac.flight)
     ? `No route on file for <b>${escapeHtml(ac.flight)}</b>.`
+    : state.routeError
+    ? `Route lookup is unavailable — ${escapeHtml(state.routeError)}. Aircraft data is unaffected.`
     : `Looking up the route for <b>${escapeHtml(ac.flight)}</b>…`;
   container.innerHTML = `<p class="route-none">${message}</p>`;
 }

@@ -8,6 +8,7 @@ import json
 import sys
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -175,7 +176,8 @@ class RouteTests(unittest.TestCase):
 
         flightwall.fetch_json = fake
         out = flightwall.get_routes([{"callsign": "UAL2402", "lat": 41.9, "lng": -87.9}])
-        self.assertEqual(out["UAL2402"]["route"], "ORD-LAX")
+        self.assertEqual(out["routes"]["UAL2402"]["route"], "ORD-LAX")
+        self.assertEqual(out["errors"], [])
 
         flightwall.get_routes([{"callsign": "UAL2402", "lat": 41.9, "lng": -87.9}])
         self.assertEqual(len(calls), 1, "second lookup should hit the cache")
@@ -186,13 +188,89 @@ class RouteTests(unittest.TestCase):
             {"callsign": "XYZ1", "_airport_codes_iata": "AAA-BBB", "plausible": 0}
         ]
         out = flightwall.get_routes([{"callsign": "XYZ1", "lat": 0, "lng": 0}])
-        self.assertIsNone(out["XYZ1"])
+        self.assertIsNone(out["routes"]["XYZ1"])
 
     def test_unanswered_callsign_is_negative_cached(self):
         flightwall.fetch_json = lambda *a, **k: []
         out = flightwall.get_routes([{"callsign": "NOPE1", "lat": 0, "lng": 0}])
-        self.assertIsNone(out["NOPE1"])
+        self.assertIsNone(out["routes"]["NOPE1"])
         self.assertIn("NOPE1", flightwall.route_cache._data)
+
+    def test_upstream_failure_is_reported_not_swallowed(self):
+        # The client cannot distinguish "still looking" from "lookup broke"
+        # unless the failure comes back, which stranded the UI on a spinner.
+        def dead(*a, **k):
+            raise OSError("connection refused")
+
+        flightwall.fetch_json = dead
+        out = flightwall.get_routes([{"callsign": "DAL926", "lat": 41.9, "lng": -87.9}])
+        self.assertEqual(out["routes"], {})
+        self.assertTrue(out["errors"])
+        self.assertIn("connection refused", out["errors"][0])
+        self.assertNotIn("DAL926", flightwall.route_cache._data,
+                         "a failed lookup must not be cached as a known miss")
+
+    def test_falls_back_to_adsbdb_when_the_batch_endpoint_misbehaves(self):
+        # The reported failure: adsb.lol answered 200 with a non-JSON body.
+        calls = []
+
+        def fake(url, payload=None, timeout=8.0):
+            calls.append(url)
+            if "adsb.lol" in url:
+                raise ValueError("HTTP 200 returned non-JSON: <empty body>")
+            return {
+                "response": {
+                    "flightroute": {
+                        "callsign": "DAL926",
+                        "callsign_iata": "DL926",
+                        "airline": {"icao": "DAL"},
+                        "origin": {
+                            "iata_code": "ATL", "icao_code": "KATL",
+                            "name": "Hartsfield Jackson Atlanta International",
+                            "municipality": "Atlanta", "country_iso_name": "US",
+                        },
+                        "destination": {
+                            "iata_code": "MSP", "icao_code": "KMSP",
+                            "name": "Minneapolis St Paul International",
+                            "municipality": "Minneapolis", "country_iso_name": "US",
+                        },
+                    }
+                }
+            }
+
+        flightwall.fetch_json = fake
+        out = flightwall.get_routes([{"callsign": "DAL926", "lat": 41.9, "lng": -87.9}])
+        entry = out["routes"]["DAL926"]
+        self.assertEqual(entry["route"], "ATL-MSP")
+        self.assertEqual(entry["airports"][0]["location"], "Atlanta")
+        self.assertEqual(entry["airports"][-1]["iata"], "MSP")
+        self.assertTrue(out["errors"], "the first provider's failure should still be reported")
+        self.assertTrue(any("adsbdb" in c for c in calls))
+
+    def test_adsbdb_404_is_a_definitive_miss(self):
+        def fake(url, payload=None, timeout=8.0):
+            if "adsb.lol" in url:
+                raise OSError("down")
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+        flightwall.fetch_json = fake
+        out = flightwall.get_routes([{"callsign": "ZZZ999", "lat": 0, "lng": 0}])
+        self.assertIsNone(out["routes"]["ZZZ999"])
+
+    def test_total_failure_does_not_negative_cache(self):
+        # Caching a miss here would hide the callsign behind "no route on file"
+        # for half an hour after the provider recovered.
+        def dead(*a, **k):
+            raise OSError("no route to host")
+
+        flightwall.fetch_json = dead
+        flightwall.get_routes([{"callsign": "DAL926", "lat": 0, "lng": 0}])
+        self.assertNotIn("DAL926", flightwall.route_cache._data)
+
+    def test_non_list_response_is_reported(self):
+        flightwall.fetch_json = lambda *a, **k: {"error": "rate limited"}
+        out = flightwall.get_routes([{"callsign": "DAL926", "lat": 0, "lng": 0}])
+        self.assertTrue(out["errors"])
 
 
 class HttpTests(unittest.TestCase):

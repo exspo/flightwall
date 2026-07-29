@@ -54,6 +54,10 @@ PROVIDERS = [
 ]
 
 ROUTE_URL = "https://api.adsb.lol/api/0/routeset"
+# Fallback, one callsign per request rather than a batch, so it is only worth
+# reaching for when the batch endpoint is unhealthy.
+ADSBDB_URL = "https://api.adsbdb.com/v0/callsign/{callsign}"
+ADSBDB_MAX_LOOKUPS = 20
 
 AIRCRAFT_TTL = 4.0  # seconds; upstreams update about this often
 ROUTE_TTL = 60 * 60 * 24 * 30
@@ -185,7 +189,15 @@ def fetch_json(url: str, payload: dict | None = None, timeout: float = 8.0):
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", "replace"))
+        status = resp.status
+        text = resp.read().decode("utf-8", "replace")
+    try:
+        return json.loads(text)
+    except ValueError:
+        # "Expecting value: line 1 column 1" says nothing about what actually
+        # came back. Quote it, so a 200-with-an-HTML-body is obvious.
+        snippet = " ".join(text.split())[:140] or "<empty body>"
+        raise ValueError(f"HTTP {status} returned non-JSON: {snippet}") from None
 
 
 def classify(ac: dict) -> str:
@@ -313,9 +325,113 @@ def get_aircraft(lat: float, lon: float, radius: float) -> dict:
     raise RuntimeError("; ".join(errors) or "no providers configured")
 
 
+def _route_entry(codes: str, airline, number, airports: list) -> dict:
+    return {
+        "route": codes,
+        "airline": airline,
+        "number": number,
+        "airports": airports,
+    }
+
+
+def _routes_via_adsblol(batch: list) -> dict:
+    """Batch lookup. Returns only the callsigns the upstream answered for."""
+    rows = fetch_json(ROUTE_URL, payload={"planes": batch}, timeout=10.0)
+    if not isinstance(rows, list):
+        raise ValueError(f"expected a list, got {type(rows).__name__}")
+
+    found = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        callsign = (row.get("callsign") or "").strip().upper()
+        if not callsign:
+            continue
+        codes = row.get("_airport_codes_iata") or ""
+        # `plausible` 0 means the upstream matched a number but does not trust
+        # it. Showing a wrong route is worse than showing none.
+        if not row.get("plausible") or codes in ("unknown", ""):
+            found[callsign] = None
+            continue
+        airports = [
+            {
+                "iata": a.get("iata"),
+                "icao": a.get("icao"),
+                "name": a.get("name"),
+                "location": a.get("location"),
+                "countryiso2": a.get("countryiso2"),
+            }
+            for a in (row.get("_airports") or [])
+        ]
+        found[callsign] = _route_entry(codes, row.get("airline_code"), row.get("number"), airports)
+    return found
+
+
+def _adsbdb_airport(node: dict) -> dict:
+    return {
+        "iata": node.get("iata_code"),
+        "icao": node.get("icao_code"),
+        "name": node.get("name"),
+        "location": node.get("municipality"),
+        "countryiso2": node.get("country_iso_name"),
+    }
+
+
+def _routes_via_adsbdb(batch: list) -> dict:
+    """One callsign per request. Capped, because a crowded sky would otherwise
+    mean dozens of sequential round trips."""
+    found = {}
+    for plane in batch[:ADSBDB_MAX_LOOKUPS]:
+        callsign = plane["callsign"]
+        try:
+            data = fetch_json(ADSBDB_URL.format(callsign=urllib.parse.quote(callsign)), timeout=8.0)
+        except urllib.error.HTTPError as exc:
+            # 404 is a definitive "no such callsign", not a transport failure.
+            if exc.code == 404:
+                found[callsign] = None
+                continue
+            raise
+
+        response = data.get("response") if isinstance(data, dict) else None
+        # An unknown callsign comes back as the string "unknown callsign".
+        flight = response.get("flightroute") if isinstance(response, dict) else None
+        if not flight:
+            found[callsign] = None
+            continue
+
+        origin = flight.get("origin") or {}
+        destination = flight.get("destination") or {}
+        if not origin or not destination:
+            found[callsign] = None
+            continue
+
+        airports = [_adsbdb_airport(origin)]
+        midpoint = flight.get("midpoint")
+        if midpoint:
+            airports.append(_adsbdb_airport(midpoint))
+        airports.append(_adsbdb_airport(destination))
+
+        codes = "-".join(a["iata"] or a["icao"] or "?" for a in airports)
+        airline = (flight.get("airline") or {}).get("icao")
+        found[callsign] = _route_entry(codes, airline, flight.get("callsign_iata"), airports)
+    return found
+
+
+ROUTE_PROVIDERS = [
+    ("adsb.lol", _routes_via_adsblol),
+    ("adsbdb.com", _routes_via_adsbdb),
+]
+
+
 def get_routes(planes: list) -> dict:
     """Resolve callsigns to ORD-LAX style routes. ADS-B never carries the route,
-    so this is a separate lookup, and it is very cacheable."""
+    so this is a separate lookup, and it is very cacheable.
+
+    Returns both the resolved routes and any upstream errors: a caller that
+    cannot tell "not looked up yet" from "the lookup failed" has no way to stop
+    showing a spinner forever.
+    """
+    errors = []
     out, unknown = {}, []
     for plane in planes:
         callsign = (plane.get("callsign") or "").strip().upper()
@@ -333,51 +449,35 @@ def get_routes(planes: list) -> dict:
 
     for batch_start in range(0, len(unknown), 100):
         batch = unknown[batch_start:batch_start + 100]
-        try:
-            rows = fetch_json(ROUTE_URL, payload={"planes": batch}, timeout=10.0)
-        except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
-            note_provider("routes", False, f"{type(exc).__name__}: {exc}")
-            continue
-        note_provider("routes", True, f"resolved {len(rows)} of {len(batch)}")
-
-        seen = set()
-        for row in rows or []:
-            callsign = (row.get("callsign") or "").strip().upper()
-            if not callsign:
+        found = None
+        for name, lookup in ROUTE_PROVIDERS:
+            try:
+                found = lookup(batch)
+            except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+                detail = f"{name}: {type(exc).__name__}: {exc}"
+                errors.append(detail)
+                note_provider("routes", False, detail)
                 continue
-            seen.add(callsign)
-            codes = row.get("_airport_codes_iata") or ""
-            # `plausible` 0 means the upstream matched a number but does not
-            # trust it. Showing a wrong route is worse than showing none.
-            if not row.get("plausible") or codes in ("unknown", ""):
-                entry = None
-            else:
-                airports = [
-                    {
-                        "iata": a.get("iata"),
-                        "icao": a.get("icao"),
-                        "name": a.get("name"),
-                        "location": a.get("location"),
-                        "countryiso2": a.get("countryiso2"),
-                    }
-                    for a in (row.get("_airports") or [])
-                ]
-                entry = {
-                    "route": codes,
-                    "airline": row.get("airline_code"),
-                    "number": row.get("number"),
-                    "airports": airports,
-                }
+            note_provider("routes", True, f"{name} resolved {len(found)} of {len(batch)}")
+            break
+
+        if found is None:
+            # Every provider failed. Do not negative-cache: that would hide the
+            # callsign behind a "no route on file" for the next half hour.
+            continue
+
+        for callsign, entry in found.items():
             route_cache.set(callsign, entry, ttl=ROUTE_TTL if entry else 60 * 60)
             out[callsign] = entry
 
-        # Negative-cache the misses too, briefly, so we stop asking every refresh.
+        # Negative-cache the ones the provider simply did not answer for, so we
+        # stop asking about them on every refresh.
         for plane in batch:
-            if plane["callsign"] not in seen:
+            if plane["callsign"] not in found:
                 route_cache.set(plane["callsign"], None, ttl=60 * 30)
                 out[plane["callsign"]] = None
 
-    return out
+    return {"routes": out, "errors": errors}
 
 
 # --------------------------------------------------------------- http serving
@@ -523,7 +623,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
-        self.send_json({"routes": get_routes(planes[:200])})
+        self.send_json(get_routes(planes[:200]))
 
 
 # ----------------------------------------------------------------- entrypoint
