@@ -19,9 +19,10 @@ from pathlib import Path
 
 DATA = Path(__file__).resolve().parent / "data"
 
-# Keep line vertices a little beyond the rim so features run off the edge of
-# the scope instead of stopping short of it.
-CLIP_MARGIN = 1.25
+# Cut lines exactly at the view radius. Any slack here would leave vertices
+# beyond the rim, and the scope clamps those to the rim - which draws a false
+# arc along the edge instead of a line leaving it.
+CLIP_MARGIN = 1.0
 MAX_CITIES = 400
 
 # Beyond this range county boundaries stop being orientation and start being

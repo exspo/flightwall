@@ -17,7 +17,10 @@ you and no account is involved.
 ```
 
 Three views: the board (one aircraft at a time, cycling or pinned), a radar
-scope centred on you, and a distance-sorted list of everything in range.
+scope centred on you, and a distance-sorted list of everything in range. The
+scope can rotate with the phone, so pointing it at an aircraft brings that
+aircraft to the top of the display, and it draws towns, county and state lines
+and major water underneath the traffic so there is something to orient by.
 
 ## The one thing that will bite you
 
@@ -99,7 +102,12 @@ Tap the gear:
 - **Radius** — 5 to 250 nm.
 - **Filters** — airliners, general aviation, helicopters, military, ground
   vehicles (off by default; these are pushback tugs and snowploughs).
+- **Show towns and boundaries** — the ground under the traffic.
 - **Keep the screen awake** — for leaving it propped up on a desk.
+
+Under the scope there is a **North up / Heading up** button. Heading up needs
+one tap to grant compass access, because iOS only releases orientation data
+after an explicit user gesture.
 
 Everything persists in `localStorage`, per device.
 
@@ -119,9 +127,18 @@ Positions come from volunteer ADS-B receivers, tried in order until one answers:
 readsb/tar1090 format, so any one of them can be down without you noticing.
 
 Routes (`ORD-LAX`) are a separate lookup — aircraft do not broadcast where they
-are going. Those come from adsb.lol's route database, cached for a month on
-disk, and are discarded when the upstream flags a match as implausible. A blank
-route beats a wrong one.
+are going. Those come from adsb.lol's route database, falling back to
+adsbdb.com, cached for a month on disk, and discarded when the upstream flags a
+match as implausible. A blank route beats a wrong one.
+
+Map features are clipped to the current view on the laptop and sent as
+distances and bearings, so a view costs a few kilobytes rather than the 2.4 MB
+the full dataset occupies, and the phone needs no map library. The scope
+compresses distance with a square root so distant traffic stays on screen;
+the map uses the same compression, which means directions are true and
+distances are squashed toward the rim. Deliberately absent: roads, whose
+Natural Earth layer alone is 50 MB, and raster map tiles, which would add a
+network dependency and break offline use.
 
 | Path | What it is |
 |---|---|
@@ -131,6 +148,8 @@ route beats a wrong one.
 | `web/app.js` | Board, radar, list, settings, geolocation. |
 | `scripts/install.sh` | launchd agent. `--uninstall` to remove. |
 | `scripts/expose.sh` | HTTPS via Tailscale, Cloudflare, or self-signed. |
+| `server/landmarks.py` | Ground features, clipped to the current view. |
+| `scripts/build_landmarks.py` | Rebuilds `server/data/` from public sources. |
 | `tests/test_server.py` | `python3 -m unittest discover -s tests` |
 
 State lives in `~/.flightwall/` — the access token and the route cache. It is

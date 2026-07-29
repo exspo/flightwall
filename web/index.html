@@ -97,6 +97,7 @@
         <label><input type="checkbox" data-filter="ground" /> Ground vehicles</label>
       </fieldset>
 
+      <label class="toggle"><input type="checkbox" id="showMap" /> Show towns and boundaries</label>
       <label class="toggle"><input type="checkbox" id="keepAwake" /> Keep the screen awake</label>
 
       <button class="ghost-btn" id="manualBtn">Set location manually</button>
@@ -104,6 +105,9 @@
       <p class="fineprint">
         Positions come from volunteer ADS-B receivers via adsb.lol, adsb.fi and airplanes.live.
         Coverage is best above a few thousand feet; aircraft without ADS-B will not appear.
+        Map data: US Census county boundaries and Natural Earth state lines and lakes, both
+        public domain; town list from kelvins/US-Cities-Database (MIT). The scope compresses
+        distance, so the map shows true directions with squashed distances.
       </p>
     </aside>
 

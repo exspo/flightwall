@@ -12,6 +12,8 @@ const POLL_MS = 6000;
 const ROUTE_POLL_MS = 25000;
 const CYCLE_MS = 9000;
 const SCROLL_PX_PER_S = 14;
+const MAX_TOWN_LABELS = 22;
+const LANDMARK_MOVE_NM = 3; // refetch the map only after moving this far
 
 const CLASS_COLOR = {
   commercial: C.CYAN,
@@ -49,6 +51,7 @@ const DEFAULT_SETTINGS = {
   keepAwake: true,
   minAlt: 0,
   headingUp: false,
+  showMap: true,
 };
 
 const state = {
@@ -69,6 +72,9 @@ const state = {
   fetching: false,
   error: null,
   source: null,
+  landmarks: null,
+  landmarkKey: null,
+  landmarksInFlight: false,
   scroll: new Map(),
   wakeLock: null,
 };
@@ -379,6 +385,7 @@ async function refresh(force = false) {
     state.error = null;
     state.lastFetch = Date.now();
     hideBanner();
+    fetchLandmarks();
     fetchRoutes();
     renderList();
   } catch (err) {
@@ -431,6 +438,41 @@ async function fetchRoutes(force = false) {
 // Classes the server can emit that have no checkbox of their own ride along
 // with the closest one that does.
 const FILTER_ALIAS = { drone: "general", lighter: "general", unknown: "general" };
+
+/**
+ * Ground features for the current view. Refetched only when you have actually
+ * moved or changed range - the ground does not move, and redrawing uses the
+ * cached copy every frame regardless.
+ */
+async function fetchLandmarks() {
+  if (!state.position || !state.settings.showMap || state.landmarksInFlight) return;
+  const { lat, lon } = state.position;
+  const radius = state.settings.radius;
+
+  if (state.landmarks && state.landmarkKey) {
+    const moved = Math.hypot(
+      (lat - state.landmarkKey.lat) * 60,
+      (lon - state.landmarkKey.lon) * 60 * Math.cos((lat * Math.PI) / 180)
+    );
+    if (moved < LANDMARK_MOVE_NM && state.landmarkKey.radius === radius) return;
+  }
+
+  state.landmarksInFlight = true;
+  try {
+    const res = await fetch(
+      `api/landmarks?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}&radius=${radius}`,
+      { credentials: "same-origin" }
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    state.landmarks = await res.json();
+    state.landmarkKey = { lat, lon, radius };
+  } catch {
+    // The map is orientation, not function. Keep whatever we last had and
+    // never let it interfere with the aircraft display.
+  } finally {
+    state.landmarksInFlight = false;
+  }
+}
 
 function visibleAircraft() {
   const { filters, minAlt } = state.settings;
@@ -592,6 +634,93 @@ function drawBoard(now) {
 
 // ------------------------------------------------------------------ the scope
 
+/**
+ * Where something at a given distance and bearing lands on the scope.
+ *
+ * The radial scale is deliberately compressed with a square root so distant
+ * traffic stays visible instead of bunching at the rim. Ground features use
+ * exactly the same mapping, so a town and an aircraft at the same distance
+ * sit at the same radius: bearings are true, distances are squashed.
+ *
+ * Everything that needs scope coordinates goes through here - drawing, the
+ * map, and the tap hit-test - because any second copy of this would
+ * eventually disagree with the first.
+ */
+function scopeXY(geometry, dst, dir) {
+  const { cx, cy, maxR, maxNm, up } = geometry;
+  const scale = Math.min(1, Math.sqrt(Math.min(dst, maxNm) / maxNm));
+  const rad = ((dir - up - 90) * Math.PI) / 180;
+  return [cx + Math.cos(rad) * maxR * scale, cy + Math.sin(rad) * maxR * scale];
+}
+
+const MAP_STYLE = {
+  counties: { color: "rgba(120,140,180,0.30)", width: 1 },
+  states: { color: "rgba(150,175,225,0.60)", width: 1.4 },
+  lakes: { color: "rgba(70,150,220,0.65)", width: 1.2 },
+};
+
+function drawMap(ctx, geometry, reserved) {
+  const map = state.landmarks;
+  if (!map || !state.settings.showMap) return;
+
+  for (const [layer, style] of Object.entries(MAP_STYLE)) {
+    const runs = map.lines?.[layer];
+    if (!runs || !runs.length) continue;
+    ctx.strokeStyle = style.color;
+    ctx.lineWidth = style.width;
+    ctx.beginPath();
+    for (const run of runs) {
+      for (let i = 0; i < run.length; i += 2) {
+        const [x, y] = scopeXY(geometry, run[i], run[i + 1]);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+    }
+    ctx.stroke();
+  }
+
+  drawTownLabels(ctx, geometry, map.cities || [], reserved);
+}
+
+/**
+ * Town names, nearest first, skipping any whose label would collide with one
+ * already placed. The server sorts by distance, so when the view is crowded
+ * the towns closest to you are the ones that survive.
+ */
+function drawTownLabels(ctx, geometry, cities, reserved) {
+  ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+
+  // Seeded with the scope's own labels - range rings and cardinal points -
+  // which are drawn afterwards and would otherwise land on top of a town.
+  const placed = [...(reserved || [])];
+  let drawn = 0;
+  for (const [name, , dst, dir] of cities) {
+    if (drawn >= MAX_TOWN_LABELS) break;
+    const [x, y] = scopeXY(geometry, dst, dir);
+    // Leave the middle clear; that is where you are.
+    if (Math.hypot(x - geometry.cx, y - geometry.cy) < 14) continue;
+
+    const width = ctx.measureText(name).width;
+    const box = { x: x + 4, y: y - 6, w: width + 4, h: 12 };
+    if (box.x + box.w > geometry.cx + geometry.maxR) box.x = x - width - 8;
+    if (placed.some((p) => box.x < p.x + p.w && box.x + box.w > p.x && box.y < p.y + p.h && box.y + box.h > p.y)) {
+      continue;
+    }
+    placed.push(box);
+    drawn += 1;
+
+    ctx.fillStyle = "rgba(150,175,225,0.85)";
+    ctx.beginPath();
+    ctx.arc(x, y, 1.6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "rgba(190,205,235,0.75)";
+    ctx.fillText(name, box.x, y);
+  }
+  ctx.textBaseline = "alphabetic";
+}
+
 function drawRadar() {
   const canvas = el("radar");
   const ctx = canvas.getContext("2d");
@@ -611,10 +740,31 @@ function drawRadar() {
   const maxR = size / 2 - 14;
   const maxNm = Math.max(1, state.settings.radius);
   const u = unit();
+  const geometry = { cx, cy, maxR, maxNm, up: headingUp() };
 
   // How far the whole scope is turned. Every bearing below is drawn relative
   // to this, so north-up and heading-up share one code path.
-  const up = headingUp();
+  const up = geometry.up;
+
+  // The scope's own labels are drawn further down but their positions are
+  // known now, so towns can be kept clear of them.
+  ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, monospace";
+  ctx.textAlign = "center";
+  const reserved = [];
+  const reserve = (text, x, y) => {
+    const w = ctx.measureText(text).width + 6;
+    reserved.push({ x: x - w / 2, y: y - 8, w, h: 15 });
+  };
+  for (const fraction of [0.33, 0.66, 1]) {
+    reserve(`${Math.round(maxNm * fraction * u.distK)}${u.dist}`, cx + 26, cy - maxR * fraction + 12);
+  }
+  for (const [label, degrees] of [["N", 0], ["E", 90], ["S", 180], ["W", 270]]) {
+    const rad = ((degrees - geometry.up - 90) * Math.PI) / 180;
+    reserve(label, cx + Math.cos(rad) * (maxR + 9), cy + Math.sin(rad) * (maxR + 9) + 3.5);
+  }
+
+  // Ground first: it belongs under the traffic, not over it.
+  drawMap(ctx, geometry, reserved);
 
   ctx.strokeStyle = "rgba(122,162,255,0.22)";
   ctx.fillStyle = "rgba(122,162,255,0.55)";
@@ -667,10 +817,7 @@ function drawRadar() {
   for (const ac of visibleAircraft()) {
     // Compress the radial scale so distant traffic stays on the scope while
     // nearby traffic still separates out near the middle.
-    const scale = Math.min(1, Math.sqrt(Math.min(ac.dst, maxNm) / maxNm));
-    const rad = ((ac.dir - up - 90) * Math.PI) / 180;
-    const x = cx + Math.cos(rad) * maxR * scale;
-    const y = cy + Math.sin(rad) * maxR * scale;
+    const [x, y] = scopeXY(geometry, ac.dst, ac.dir);
     const focused = ac.hex === state.focusHex;
     const color = PALETTE[colorOf(ac)];
 
@@ -855,17 +1002,18 @@ function bindControls() {
     const rect = el("radar").getBoundingClientRect();
     const tapX = event.clientX - rect.left;
     const tapY = event.clientY - rect.top;
-    const cx = rect.width / 2;
-    const maxR = rect.width / 2 - 14;
-    const maxNm = Math.max(1, state.settings.radius);
+    // Same projection the drawing uses, so taps cannot land on the wrong blip.
+    const geometry = {
+      cx: rect.width / 2,
+      cy: rect.width / 2,
+      maxR: rect.width / 2 - 14,
+      maxNm: Math.max(1, state.settings.radius),
+      up: headingUp(),
+    };
     let best = null;
     let bestDist = 28;
-    const up = headingUp(); // must match drawRadar, or taps land on the wrong blip
     for (const ac of visibleAircraft()) {
-      const scale = Math.min(1, Math.sqrt(Math.min(ac.dst, maxNm) / maxNm));
-      const rad = ((ac.dir - up - 90) * Math.PI) / 180;
-      const x = cx + Math.cos(rad) * maxR * scale;
-      const y = cx + Math.sin(rad) * maxR * scale;
+      const [x, y] = scopeXY(geometry, ac.dst, ac.dir);
       const d = Math.hypot(x - tapX, y - tapY);
       if (d < bestDist) {
         bestDist = d;
@@ -897,6 +1045,7 @@ function bindControls() {
     state.settings.radius = Number(event.target.value);
     el("radiusValue").textContent = `${state.settings.radius} NM`;
     saveSettings();
+    fetchLandmarks();
     refresh(true);
   });
   el("radius").addEventListener("input", (event) => {
@@ -909,6 +1058,12 @@ function bindControls() {
       saveSettings();
       renderList();
     });
+  });
+
+  el("showMap").addEventListener("change", (event) => {
+    state.settings.showMap = event.target.checked;
+    saveSettings();
+    if (state.settings.showMap) fetchLandmarks();
   });
 
   el("keepAwake").addEventListener("change", (event) => {
@@ -955,6 +1110,7 @@ function syncControls() {
   el("radius").value = String(state.settings.radius);
   el("radiusValue").textContent = `${state.settings.radius} NM`;
   el("keepAwake").checked = state.settings.keepAwake;
+  el("showMap").checked = state.settings.showMap;
   document.querySelectorAll("[data-filter]").forEach((input) => {
     input.checked = Boolean(state.settings.filters[input.dataset.filter]);
   });

@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "server"))
 
 import flightwall  # noqa: E402
+import landmarks  # noqa: E402
 
 ORD = (41.9742, -87.9073)
 
@@ -351,7 +352,7 @@ class HttpTests(unittest.TestCase):
         distances = [c[2] for c in data["cities"]]
         self.assertEqual(distances, sorted(distances))
         # Nothing may be reported beyond the clip boundary.
-        limit = 60 * 1.25
+        limit = 60 * landmarks.CLIP_MARGIN
         for runs in data["lines"].values():
             for run in runs:
                 self.assertLessEqual(max(run[0::2]), limit + 0.01)
