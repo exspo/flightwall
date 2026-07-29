@@ -30,6 +30,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import landmarks
+
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
 STATE = Path(os.environ.get("FLIGHTWALL_HOME", Path.home() / ".flightwall"))
@@ -166,6 +168,9 @@ class TTLCache:
 
 aircraft_cache = TTLCache(AIRCRAFT_TTL)
 route_cache = TTLCache(ROUTE_TTL)
+# The ground does not move, so one view stays valid for as long as the phone
+# stays roughly put.
+landmark_cache = TTLCache(60 * 30, max_entries=256)
 provider_health: dict = {}
 _provider_lock = threading.Lock()
 
@@ -570,6 +575,31 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.UNAUTHORIZED, "Add ?k=<token> to the URL")
             else:
                 self.send_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+            return
+
+        if path == "/api/landmarks":
+            try:
+                lat = float((query.get("lat") or [""])[0])
+                lon = float((query.get("lon") or [""])[0])
+            except ValueError:
+                self.send_json({"error": "lat and lon are required"}, HTTPStatus.BAD_REQUEST)
+                return
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                self.send_json({"error": "lat/lon out of range"}, HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                radius = float((query.get("radius") or ["60"])[0])
+            except ValueError:
+                radius = 60.0
+            radius = max(1.0, min(MAX_RADIUS_NM, radius))
+            # Coarser key than aircraft: ground features do not need refreshing
+            # for every small change in position.
+            key = (round(lat, 2), round(lon, 2), round(radius))
+            cached = landmark_cache.get(key)
+            if cached is None:
+                cached = landmarks.query(lat, lon, radius)
+                landmark_cache.set(key, cached)
+            self.send_json(cached)
             return
 
         if path == "/api/aircraft":

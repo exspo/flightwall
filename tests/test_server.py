@@ -342,6 +342,31 @@ class HttpTests(unittest.TestCase):
         status, _, _ = self.get("/../server/flightwall.py?k=test-token")
         self.assertIn(status, (400, 404))
 
+    def test_landmarks_are_clipped_to_the_view(self):
+        status, body, _ = self.get("/api/landmarks?lat=41.9742&lon=-87.9073&radius=60&k=test-token")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["cities"], "expected towns near O'Hare")
+        # Nearest first: the client draws in order and drops colliding labels.
+        distances = [c[2] for c in data["cities"]]
+        self.assertEqual(distances, sorted(distances))
+        # Nothing may be reported beyond the clip boundary.
+        limit = 60 * 1.25
+        for runs in data["lines"].values():
+            for run in runs:
+                self.assertLessEqual(max(run[0::2]), limit + 0.01)
+
+    def test_landmarks_drop_counties_at_wide_range(self):
+        _, body, _ = self.get("/api/landmarks?lat=41.9742&lon=-87.9073&radius=250&k=test-token")
+        self.assertEqual(json.loads(body)["lines"]["counties"], [])
+
+    def test_landmarks_reject_bad_coordinates(self):
+        self.assertEqual(self.get("/api/landmarks?k=test-token")[0], 400)
+        self.assertEqual(self.get("/api/landmarks?lat=99&lon=0&k=test-token")[0], 400)
+
+    def test_landmarks_need_the_token(self):
+        self.assertEqual(self.get("/api/landmarks?lat=41&lon=-87")[0], 401)
+
     def test_static_assets_are_served(self):
         for path in ("/index.html", "/app.js", "/led.js", "/styles.css",
                      "/manifest.webmanifest", "/data/airlines.json", "/icons/icon-180.png"):
