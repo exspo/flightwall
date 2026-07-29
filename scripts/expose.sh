@@ -72,13 +72,26 @@ case "$METHOD" in
     "$TS" status >/dev/null 2>&1 || die "tailscale is installed but not logged in. Run: $TS up"
 
     say "publishing through Tailscale"
-    if ! serve_error="$("$TS" serve --bg --https=443 "http://127.0.0.1:$PORT" 2>&1)"; then
+    echo "    (the first run provisions a TLS certificate and can take up to a minute)"
+
+    # Stream the output rather than capturing it: on a first run this sits
+    # silent while a certificate is issued, and capturing would also swallow
+    # any prompt tailscale decides to show. tee keeps a copy for the error
+    # classification below.
+    serve_log="$(mktemp -t flightwall-serve)"
+    serve_rc=0
+    "$TS" serve --bg --https=443 "http://127.0.0.1:$PORT" 2>&1 | tee "$serve_log" || serve_rc=$?
+
+    if (( serve_rc != 0 )); then
+      serve_error="$(cat "$serve_log")"
+      rm -f "$serve_log"
       # Almost always the tailnet-wide toggle rather than anything local.
       if grep -qi "cert\|HTTPS\|not enabled\|MagicDNS" <<<"$serve_error"; then
-        die "Tailscale refused to issue a certificate. Enable MagicDNS *and* HTTPS Certificates for the tailnet at https://login.tailscale.com/admin/dns then re-run. Original error: $serve_error"
+        die "Tailscale refused to issue a certificate. Enable MagicDNS *and* HTTPS Certificates for the tailnet at https://login.tailscale.com/admin/dns then re-run."
       fi
-      die "tailscale serve failed: $serve_error"
+      die "tailscale serve failed (exit $serve_rc). See the output above."
     fi
+    rm -f "$serve_log"
 
     HOST="$("$TS" status --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["Self"]["DNSName"].rstrip("."))')"
     [[ -n "$HOST" ]] || die "could not read this machine's tailnet hostname"
