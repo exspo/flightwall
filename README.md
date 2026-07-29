@@ -57,10 +57,16 @@ It picks the best method available:
 Tailscale is the right answer for a machine that is always on: a stable private
 hostname with a real certificate, so the home-screen icon keeps working.
 
+Sign in to Tailscale on both the laptop and the phone, then:
+
 ```bash
-brew install --cask tailscale   # sign in on the laptop and the phone
+brew install --cask tailscale
 ./scripts/expose.sh tailscale
 ```
+
+Commands in this README carry no inline `#` comments, because macOS zsh does not
+treat `#` as a comment at an interactive prompt — pasting one can leave you at a
+`quote>` prompt or, worse, run a backtick or `>` inside it.
 
 ## Put it on the phone
 

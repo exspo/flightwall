@@ -92,24 +92,46 @@ how many aircraft? and the phone URL.
 
 ## FORM B — raw shell fallback
 
+Paste this block as-is. It carries no inline comments on purpose: macOS zsh has
+`interactive_comments` **off** by default, so a `#` pasted at the prompt is not a
+comment. An apostrophe after one opens a quote and drops you at `quote>`, and a
+backtick or `>` would be run as substitution or redirection. Prose stays out of
+the block for that reason.
+
 ```bash
 set -e
 git clone -b claude/location-based-phone-app-skyx4u https://github.com/exspo/flightwall.git ~/flightwall 2>/dev/null \
   || git -C ~/flightwall pull --rebase --autostash
 cd ~/flightwall
-python3 --version                                  # must be 3.9+
-python3 -m unittest discover -s tests              # expect: 25 tests, OK
-./scripts/install.sh                               # prints the token
+python3 --version
+python3 -m unittest discover -s tests
+./scripts/install.sh
 curl -fsS http://127.0.0.1:8730/api/health >/dev/null && echo "server ok"
-
-# Tailscale: if `tailscale` is missing but the app is installed, the Mac App
-# Store build hides the CLI in the bundle — open Tailscale > Install CLI.
 tailscale status >/dev/null || tailscale up
-
-# Requires MagicDNS + HTTPS Certificates enabled for the tailnet at
-# https://login.tailscale.com/admin/dns — these are admin-console toggles.
-./scripts/expose.sh tailscale                      # prints the phone URL
+./scripts/expose.sh tailscale
 ```
+
+Step by step, and what to expect:
+
+| Line | Expect |
+|---|---|
+| `python3 --version` | 3.9 or newer |
+| `python3 -m unittest …` | `Ran 25 tests … OK` |
+| `./scripts/install.sh` | prints your access token and the local URL |
+| `curl … /api/health` | `server ok` |
+| `tailscale status` | this machine listed; `tailscale up` runs only if not signed in |
+| `./scripts/expose.sh tailscale` | prints the `https://….ts.net/?k=…` phone URL |
+
+If `tailscale` is reported as not found but the app **is** installed, you have
+the Mac App Store build, which keeps its CLI inside the app bundle. Open
+Tailscale and choose "Install CLI", then re-run the last two lines.
+`expose.sh` also looks inside the bundle itself, so it will usually find it
+regardless.
+
+`expose.sh tailscale` needs MagicDNS **and** HTTPS Certificates enabled for the
+tailnet, at <https://login.tailscale.com/admin/dns>. Those are admin-console
+toggles that cannot be set from this machine; the script detects that specific
+failure and says so.
 
 ## On the phone
 
