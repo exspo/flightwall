@@ -408,6 +408,7 @@ async function fetchRoutes() {
       state.routes.set(callsign, route);
     }
     renderList();
+    renderRoute(); // the focused aircraft's route may have just arrived
   } catch {
     /* routes are decoration; never let them break the board */
   }
@@ -557,6 +558,7 @@ function drawBoard(now) {
     // letting renderList paint a highlight one frame behind.
     state.focusHex = nextHex;
     syncListHighlight();
+    renderRoute();
   }
   const frame = board.frame;
   frame.clear();
@@ -721,6 +723,67 @@ function renderList() {
         </button>`;
     })
     .join("");
+}
+
+/** ISO 3166-1 alpha-2 to a flag emoji, by offsetting into the regional
+ *  indicator block. Cheap way to mark an international leg. */
+function flagOf(iso2) {
+  if (!iso2 || iso2.length !== 2 || !/^[A-Z]{2}$/.test(iso2)) return "";
+  return String.fromCodePoint(...[...iso2].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
+}
+
+function routeLeg(role, airport) {
+  const code = airport.iata || airport.icao || "??";
+  const flag = flagOf((airport.countryiso2 || "").toUpperCase());
+  const city = [airport.location, flag].filter(Boolean).join(" ");
+  return `
+    <div class="route-leg ${role === "From" ? "from" : "to"}">
+      <span class="route-role">${role}</span>
+      <span class="route-code">${escapeHtml(code)}</span>
+      <span class="route-place">
+        <span class="route-airport">${escapeHtml(airport.name || airport.location || "Unknown airport")}</span>
+        ${city ? `<span class="route-city">${escapeHtml(city)}</span>` : ""}
+      </span>
+    </div>`;
+}
+
+/**
+ * Where the focused aircraft came from and where it is going. The board only
+ * has room for the ORD-LAX code pair, so the readable version lives here.
+ */
+function renderRoute() {
+  const container = el("route");
+  const ac = state.aircraft.find((a) => a.hex === state.focusHex);
+  if (!ac) {
+    container.innerHTML = `<p class="route-none">No aircraft selected.</p>`;
+    return;
+  }
+
+  const route = state.routes.get(ac.flight);
+  if (route && route.airports && route.airports.length >= 2) {
+    const from = route.airports[0];
+    const to = route.airports[route.airports.length - 1];
+    // Three or more airports means an intermediate stop the API knows about.
+    const via = route.airports.slice(1, -1);
+    container.innerHTML =
+      routeLeg("From", from) +
+      `<div class="route-rule"></div>` +
+      (via.length
+        ? `<p class="route-none">via ${via.map((a) => escapeHtml(a.iata || a.icao || "")).join(", ")}</p>`
+        : "") +
+      routeLeg("To", to);
+    return;
+  }
+
+  // Distinguish "we have not looked yet" from "there is nothing to find" -
+  // a private flight has no route to report and never will.
+  const airline = airlineOf(ac);
+  const message = !airline
+    ? `<b>${escapeHtml(ac.reg || ac.flight || "This aircraft")}</b> is not flying an airline callsign, so there is no filed route to look up.`
+    : state.routes.has(ac.flight)
+    ? `No route on file for <b>${escapeHtml(ac.flight)}</b>.`
+    : `Looking up the route for <b>${escapeHtml(ac.flight)}</b>…`;
+  container.innerHTML = `<p class="route-none">${message}</p>`;
 }
 
 /** Move the highlight without rebuilding the list markup - this runs whenever

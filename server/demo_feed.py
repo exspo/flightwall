@@ -24,13 +24,33 @@ FLEET = [
     ("N682QS", "N682QS", "C68A", "CESSNA 680A Latitude", "A2", 155, 18.9, 15000, 330, 210, 2200, 0),
 ]
 
+# callsign -> (airline, number, [(iata, icao, airport name, city, country), ...])
 ROUTES = {
-    "UAL2402": ("ORD-LAX", "UAL", "2402", ["Chicago", "Los Angeles"], ["ORD", "LAX"]),
-    "DAL1119": ("ATL-MSP", "DAL", "1119", ["Atlanta", "Minneapolis"], ["ATL", "MSP"]),
-    "SWA88": ("MDW-DEN", "SWA", "88", ["Chicago", "Denver"], ["MDW", "DEN"]),
-    "AAL717": ("ORD-LHR", "AAL", "717", ["Chicago", "London"], ["ORD", "LHR"]),
-    "FDX1284": ("MEM-SEA", "FDX", "1284", ["Memphis", "Seattle"], ["MEM", "SEA"]),
-    "ACA795": ("YYZ-ORD", "ACA", "795", ["Toronto", "Chicago"], ["YYZ", "ORD"]),
+    "UAL2402": ("UAL", "2402", [
+        ("ORD", "KORD", "Chicago O'Hare International", "Chicago", "US"),
+        ("LAX", "KLAX", "Los Angeles International", "Los Angeles", "US"),
+    ]),
+    "DAL1119": ("DAL", "1119", [
+        ("ATL", "KATL", "Hartsfield Jackson Atlanta International", "Atlanta", "US"),
+        ("MSP", "KMSP", "Minneapolis St Paul International", "Minneapolis", "US"),
+    ]),
+    "SWA88": ("SWA", "88", [
+        ("MDW", "KMDW", "Chicago Midway International", "Chicago", "US"),
+        ("DEN", "KDEN", "Denver International", "Denver", "US"),
+    ]),
+    "AAL717": ("AAL", "717", [
+        ("ORD", "KORD", "Chicago O'Hare International", "Chicago", "US"),
+        ("LHR", "EGLL", "London Heathrow", "London", "GB"),
+    ]),
+    "FDX1284": ("FDX", "1284", [
+        ("MEM", "KMEM", "Memphis International", "Memphis", "US"),
+        ("IND", "KIND", "Indianapolis International", "Indianapolis", "US"),
+        ("SEA", "KSEA", "Seattle Tacoma International", "Seattle", "US"),
+    ]),
+    "ACA795": ("ACA", "795", [
+        ("YYZ", "CYYZ", "Toronto Pearson International", "Toronto", "CA"),
+        ("ORD", "KORD", "Chicago O'Hare International", "Chicago", "US"),
+    ]),
 }
 
 
@@ -85,16 +105,16 @@ def routes(planes: list) -> list:
         entry = ROUTES.get(callsign)
         if not entry:
             continue
-        code, airline, number, locations, iatas = entry
+        airline, number, airports = entry
         out.append({
             "callsign": callsign,
             "airline_code": airline,
             "number": number,
-            "_airport_codes_iata": code,
+            "_airport_codes_iata": "-".join(a[0] for a in airports),
             "plausible": 1,
             "_airports": [
-                {"iata": iata, "icao": f"K{iata}", "location": loc, "name": loc}
-                for iata, loc in zip(iatas, locations)
+                {"iata": iata, "icao": icao, "name": name, "location": city, "countryiso2": country}
+                for iata, icao, name, city, country in airports
             ],
         })
     return out
