@@ -213,6 +213,39 @@ main {
   color: var(--text);
 }
 
+/* Links out to a flight tracker. Padded to a comfortable thumb target rather
+   than relying on the text's own height. */
+a.route-callsign {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: -4px -6px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  color: var(--cyan);
+  text-decoration: none;
+}
+
+a.route-callsign svg {
+  opacity: 0.7;
+}
+
+a.route-callsign:active {
+  background: rgba(53, 224, 208, 0.12);
+}
+
+a.route-reg {
+  color: var(--muted);
+  text-decoration: underline;
+  text-decoration-color: rgba(133, 146, 171, 0.4);
+  text-underline-offset: 3px;
+  padding: 4px 0;
+}
+
+a.route-reg:active {
+  color: var(--text);
+}
+
 .route-airline {
   font-size: 13px;
   color: var(--muted);

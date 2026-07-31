@@ -906,6 +906,33 @@ function flagOf(iso2) {
   return String.fromCodePoint(...[...iso2].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
 }
 
+/**
+ * Where to send someone who wants the full picture on a flight.
+ *
+ * FlightAware's /live/flight/ path accepts an airline callsign and a tail
+ * number alike, so one URL shape covers both. An aircraft broadcasting
+ * neither still has its ICAO address, which the tracker that feeds this app
+ * can look up.
+ */
+function trackerLink(ac) {
+  const ident = (ac.flight || ac.reg || "").trim();
+  if (ident) {
+    return {
+      url: `https://flightaware.com/live/flight/${encodeURIComponent(ident)}`,
+      label: "FlightAware",
+    };
+  }
+  if (ac.hex) {
+    return { url: `https://adsb.lol/?icao=${encodeURIComponent(ac.hex)}`, label: "adsb.lol" };
+  }
+  return null;
+}
+
+const EXTERNAL_ICON =
+  '<svg viewBox="0 0 24 24" width="11" height="11" aria-hidden="true">' +
+  '<path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" ' +
+  'd="M14 4h6v6M20 4l-8.5 8.5M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>';
+
 function routeLeg(role, airport) {
   const code = airport.iata || airport.icao || "??";
   const flag = flagOf((airport.countryiso2 || "").toUpperCase());
@@ -936,11 +963,26 @@ function renderRoute() {
   // The flight number heads the panel in every case, including when no route
   // resolves - it is the thing you need to look the flight up elsewhere.
   const airlineName = airlineOf(ac);
+  const ident = ac.flight || ac.reg || ac.hex.toUpperCase();
+  const tracker = trackerLink(ac);
+  // rel=noopener because target=_blank otherwise hands the opened page a
+  // reference back to this one.
+  const callsign = tracker
+    ? `<a class="route-callsign link" href="${tracker.url}" target="_blank" rel="noopener noreferrer"
+         title="Open ${escapeHtml(ident)} on ${tracker.label}">${escapeHtml(ident)}${EXTERNAL_ICON}</a>`
+    : `<span class="route-callsign">${escapeHtml(ident)}</span>`;
+
   const header = `
     <div class="route-flight">
-      <span class="route-callsign">${escapeHtml(ac.flight || ac.reg || ac.hex.toUpperCase())}</span>
+      ${callsign}
       ${airlineName ? `<span class="route-airline">${escapeHtml(airlineName.name)}</span>` : ""}
-      ${ac.reg && ac.reg !== ac.flight ? `<span class="route-reg">${escapeHtml(ac.reg)}</span>` : ""}
+      ${
+        ac.reg && ac.reg !== ac.flight
+          ? `<a class="route-reg link" href="https://flightaware.com/live/flight/${encodeURIComponent(ac.reg)}"
+               target="_blank" rel="noopener noreferrer"
+               title="Aircraft history for ${escapeHtml(ac.reg)}">${escapeHtml(ac.reg)}</a>`
+          : ""
+      }
     </div>`;
 
   const route = state.routes.get(ac.flight);

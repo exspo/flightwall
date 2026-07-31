@@ -155,6 +155,11 @@ network dependency and break offline use.
 State lives in `~/.flightwall/` — the access token and the route cache. It is
 never written into the repo.
 
+The flight number in the route panel links out to FlightAware for the full
+picture — schedules, history, the things a raw ADS-B feed cannot tell you. It
+is the only part of the app that reaches anywhere other than your own laptop,
+and only when you tap it.
+
 ## What it cannot show you
 
 - **Aircraft without ADS-B.** Most airliners transmit; many older light
