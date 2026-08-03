@@ -128,8 +128,20 @@ readsb/tar1090 format, so any one of them can be down without you noticing.
 
 Routes (`ORD-LAX`) are a separate lookup — aircraft do not broadcast where they
 are going. Those come from adsb.lol's route database, falling back to
-adsbdb.com, cached for a month on disk, and discarded when the upstream flags a
-match as implausible. A blank route beats a wrong one.
+adsbdb.com, cached for a day.
+
+Those databases are keyed on flight number and go stale, and for regional
+carriers they are wrong often enough to matter: a retired or reused number
+keeps its old airports and reads as fact. So every record is checked against
+the aircraft's own broadcast position — if the aircraft is nowhere near the
+claimed path, the route is withheld and the panel says which record it
+distrusted. Multi-leg routes are checked leg by leg, and the tolerance is
+generous, since real flights hold and get vectored around weather.
+
+This makes wrong routes stop appearing; it does not make routes correct. For
+genuinely reliable routes and times you would need a commercial flight-data
+API with an account and a key — a different shape of project from a
+self-hosted board with no accounts in it.
 
 Map features are clipped to the current view on the laptop and sent as
 distances and bearings, so a view costs a few kilobytes rather than the 2.4 MB

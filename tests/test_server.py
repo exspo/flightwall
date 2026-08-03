@@ -274,6 +274,75 @@ class RouteTests(unittest.TestCase):
         self.assertTrue(out["errors"])
 
 
+class RoutePlausibilityTests(unittest.TestCase):
+    """Route records are keyed on flight number and go stale. The aircraft is
+    broadcasting where it really is, so that is the arbiter."""
+
+    PHL = {"iata": "PHL", "lat": 39.8719, "lon": -75.2411}
+    ALB = {"iata": "ALB", "lat": 42.7483, "lon": -73.8017}
+    CHO = {"iata": "CHO", "lat": 38.1386, "lon": -78.4529}
+    LAX = {"iata": "LAX", "lat": 33.9425, "lon": -118.4081}
+    CHARLOTTESVILLE = (38.0386, -78.4529)
+
+    def test_rejects_the_observed_bad_record(self):
+        # PDT6055 was labelled PHL-ALB while descending over Charlottesville,
+        # roughly 200 nm from anywhere on that route.
+        entry = {"route": "PHL-ALB", "airports": [self.PHL, self.ALB]}
+        self.assertFalse(flightwall.route_is_plausible(entry, *self.CHARLOTTESVILLE))
+
+    def test_accepts_the_route_it_was_probably_flying(self):
+        entry = {"route": "PHL-CHO", "airports": [self.PHL, self.CHO]}
+        self.assertTrue(flightwall.route_is_plausible(entry, *self.CHARLOTTESVILLE))
+
+    def test_accepts_an_aircraft_mid_route(self):
+        entry = {"airports": [self.PHL, self.ALB]}
+        self.assertTrue(flightwall.route_is_plausible(entry, 41.3, -74.5))
+
+    def test_accepts_an_aircraft_at_either_end(self):
+        entry = {"airports": [self.PHL, self.ALB]}
+        self.assertTrue(flightwall.route_is_plausible(entry, self.PHL["lat"], self.PHL["lon"]))
+        self.assertTrue(flightwall.route_is_plausible(entry, self.ALB["lat"], self.ALB["lon"]))
+
+    def test_tolerates_routine_vectoring(self):
+        # Being pushed 50 nm off a 200 nm leg is ordinary, not evidence of a
+        # bad record.
+        entry = {"airports": [self.PHL, self.ALB]}
+        self.assertTrue(flightwall.route_is_plausible(entry, 41.3, -73.4))
+
+    def test_multi_leg_is_checked_leg_by_leg(self):
+        # Partway through PHL-CHO-LAX an aircraft sits far off the direct
+        # PHL-to-LAX line, which endpoint-only checking would reject.
+        entry = {"airports": [self.PHL, self.CHO, self.LAX]}
+        self.assertTrue(flightwall.route_is_plausible(entry, *self.CHARLOTTESVILLE))
+
+    def test_missing_coordinates_do_not_reject(self):
+        # No basis for a verdict means no verdict, rather than a guess.
+        entry = {"airports": [{"iata": "AAA"}, {"iata": "BBB"}]}
+        self.assertTrue(flightwall.route_is_plausible(entry, *self.CHARLOTTESVILLE))
+        self.assertTrue(flightwall.route_is_plausible({"airports": [self.PHL, self.ALB]}, None, None))
+
+    def test_get_routes_flags_rather_than_drops(self):
+        real = flightwall.fetch_json
+        flightwall.route_cache._data.clear()
+        try:
+            flightwall.fetch_json = lambda *a, **k: [{
+                "callsign": "PDT6055", "airline_code": "PDT", "number": "6055",
+                "_airport_codes_iata": "PHL-ALB", "plausible": 1,
+                "_airports": [
+                    {"iata": "PHL", "lat": 39.8719, "lon": -75.2411, "location": "Philadelphia"},
+                    {"iata": "ALB", "lat": 42.7483, "lon": -73.8017, "location": "Albany"},
+                ],
+            }]
+            out = flightwall.get_routes(
+                [{"callsign": "PDT6055", "lat": 38.0386, "lng": -78.4529}]
+            )
+        finally:
+            flightwall.fetch_json = real
+        entry = out["routes"]["PDT6055"]
+        self.assertTrue(entry["suspect"], "a contradicted route must be flagged")
+        self.assertEqual(entry["route"], "PHL-ALB", "the rejected route stays visible for diagnosis")
+
+
 class HttpTests(unittest.TestCase):
     """Exercise the real handler over a real socket."""
 

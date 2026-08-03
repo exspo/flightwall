@@ -62,7 +62,7 @@ ADSBDB_URL = "https://api.adsbdb.com/v0/callsign/{callsign}"
 ADSBDB_MAX_LOOKUPS = 20
 
 AIRCRAFT_TTL = 4.0  # seconds; upstreams update about this often
-ROUTE_TTL = 60 * 60 * 24 * 30
+ROUTE_TTL = 60 * 60 * 24  # one day: any longer just preserves stale records
 MAX_RADIUS_NM = 250
 
 # ICAO type codes that are rotorcraft but do not always broadcast category A7.
@@ -365,6 +365,8 @@ def _routes_via_adsblol(batch: list) -> dict:
                 "name": a.get("name"),
                 "location": a.get("location"),
                 "countryiso2": a.get("countryiso2"),
+                "lat": to_number(a.get("lat") if a.get("lat") is not None else a.get("latitude")),
+                "lon": to_number(a.get("lon") if a.get("lon") is not None else a.get("longitude")),
             }
             for a in (row.get("_airports") or [])
         ]
@@ -379,6 +381,8 @@ def _adsbdb_airport(node: dict) -> dict:
         "name": node.get("name"),
         "location": node.get("municipality"),
         "countryiso2": node.get("country_iso_name"),
+        "lat": to_number(node.get("latitude")),
+        "lon": to_number(node.get("longitude")),
     }
 
 
@@ -426,6 +430,55 @@ ROUTE_PROVIDERS = [
     ("adsb.lol", _routes_via_adsblol),
     ("adsbdb.com", _routes_via_adsbdb),
 ]
+
+# How far off the claimed path an aircraft may be before the route is treated
+# as a bad record. Generous, because real flights hold, divert and get vectored
+# around weather - this is meant to catch a route that is simply wrong, not to
+# police routine deviation.
+ROUTE_SLACK_NM = 60.0
+ROUTE_SLACK_FRACTION = 0.15
+
+
+def _leg_excess_nm(lat, lon, a: dict, b: dict):
+    """How far off a direct A-to-B leg the aircraft is, in nautical miles.
+
+    Uses the ellipse property: for a point on the line between two foci, the
+    summed distance equals the separation. Anything further away is off the
+    path, and the excess grows smoothly with the deviation.
+    """
+    if None in (a.get("lat"), a.get("lon"), b.get("lat"), b.get("lon")):
+        return None
+    leg = haversine_nm(a["lat"], a["lon"], b["lat"], b["lon"])
+    detour = haversine_nm(lat, lon, a["lat"], a["lon"]) + haversine_nm(lat, lon, b["lat"], b["lon"])
+    return detour - leg, leg
+
+
+def route_is_plausible(entry: dict, lat, lon) -> bool:
+    """Does this aircraft's actual position support the claimed route?
+
+    Route databases are keyed on flight number and go stale: a reused or
+    retired number keeps its old airports, and the result is a confident,
+    wrong answer. The aircraft is broadcasting where it really is, so use
+    that as the arbiter.
+
+    Multi-leg routes are checked leg by leg, since an aircraft partway
+    through A-B-C can sit far off the direct A-to-C line quite legitimately.
+    """
+    airports = (entry or {}).get("airports") or []
+    if len(airports) < 2 or lat is None or lon is None:
+        return True  # nothing to check against; do not invent a verdict
+
+    best = None
+    for first, second in zip(airports, airports[1:]):
+        measured = _leg_excess_nm(lat, lon, first, second)
+        if measured is None:
+            return True  # missing coordinates, so no basis to reject
+        excess, leg = measured
+        allowed = max(ROUTE_SLACK_NM, ROUTE_SLACK_FRACTION * leg)
+        if excess <= allowed:
+            return True
+        best = excess if best is None else min(best, excess)
+    return False
 
 
 def get_routes(planes: list) -> dict:
@@ -481,6 +534,28 @@ def get_routes(planes: list) -> dict:
             if plane["callsign"] not in found:
                 route_cache.set(plane["callsign"], None, ttl=60 * 30)
                 out[plane["callsign"]] = None
+
+    # Verify against where each aircraft actually is, every time rather than
+    # once at cache-fill: the same cached record is plausible early in a flight
+    # and absurd later, and only the live position can tell the difference.
+    positions = {}
+    for plane in planes:
+        callsign = (plane.get("callsign") or "").strip().upper()
+        if callsign:
+            positions[callsign] = (
+                to_number(plane.get("lat")),
+                to_number(plane.get("lng")) if plane.get("lng") is not None else to_number(plane.get("lon")),
+            )
+
+    for callsign, entry in list(out.items()):
+        if not entry:
+            continue
+        lat, lon = positions.get(callsign, (None, None))
+        if not route_is_plausible(entry, lat, lon):
+            # Hand it back flagged rather than silently dropping it, so the
+            # phone can say which record it distrusted instead of implying no
+            # route exists.
+            out[callsign] = {**entry, "suspect": True}
 
     return {"routes": out, "errors": errors}
 

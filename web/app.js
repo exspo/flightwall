@@ -193,11 +193,22 @@ function titleOf(ac) {
   return ac.reg || ac.flight || ac.hex.toUpperCase();
 }
 
-function subtitleOf(ac) {
+/**
+ * The route for an aircraft, but only when its own position supports it.
+ *
+ * Route databases are keyed on flight number and go stale; the server checks
+ * each record against where the aircraft actually is and flags the ones that
+ * do not hold up. A confidently wrong route is worse than none, so a flagged
+ * record never reaches the board or the list.
+ */
+function usableRoute(ac) {
   const route = state.routes.get(ac.flight);
-  if (route && route.route) return route.route.toUpperCase();
-  if (ac.flight) return ac.flight;
-  return ac.reg || "NO CALLSIGN";
+  return route && !route.suspect ? route : null;
+}
+
+function suspectRoute(ac) {
+  const route = state.routes.get(ac.flight);
+  return route && route.suspect ? route : null;
 }
 
 function colorOf(ac) {
@@ -572,7 +583,7 @@ function boardLines(ac) {
     ];
   }
 
-  const route = state.routes.get(ac.flight);
+  const route = usableRoute(ac);
   const airline = airlineOf(ac);
   const color = colorOf(ac);
 
@@ -870,7 +881,7 @@ function renderList() {
   container.innerHTML = list
     .slice(0, 60)
     .map((ac) => {
-      const route = state.routes.get(ac.flight);
+      const route = usableRoute(ac);
       const color = PALETTE[colorOf(ac)];
       const title = titleOf(ac);
       // Flight number first. The route used to replace it, which hid the one
@@ -985,7 +996,7 @@ function renderRoute() {
       }
     </div>`;
 
-  const route = state.routes.get(ac.flight);
+  const route = usableRoute(ac);
   if (route && route.airports && route.airports.length >= 2) {
     const from = route.airports[0];
     const to = route.airports[route.airports.length - 1];
@@ -1005,8 +1016,15 @@ function renderRoute() {
   // Distinguish "we have not looked yet" from "there is nothing to find" -
   // a private flight has no route to report and never will.
   const airline = airlineOf(ac);
+  const suspect = suspectRoute(ac);
   const message = !airline
     ? "Flying under a tail number rather than an airline callsign, so there is no filed route to look up."
+    : suspect
+    // Naming the rejected route matters: it is usually recognisable as an old
+    // schedule, and it makes the judgement checkable rather than mysterious.
+    ? `The route on file for <b>${escapeHtml(ac.flight)}</b> is <b>${escapeHtml(
+        (suspect.route || "unknown").toUpperCase()
+      )}</b>, which does not pass anywhere near this aircraft. Treating it as a stale record and not showing it — tap the flight number for the live picture.`
     : state.routes.has(ac.flight)
     ? `No route on file for <b>${escapeHtml(ac.flight)}</b>.`
     : state.routeError
