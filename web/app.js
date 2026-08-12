@@ -72,6 +72,7 @@ const state = {
   fetching: false,
   error: null,
   source: null,
+  allProvidersEmpty: false,
   landmarks: null,
   landmarkKey: null,
   landmarksInFlight: false,
@@ -393,6 +394,7 @@ async function refresh(force = false) {
     const data = await res.json();
     state.aircraft = data.aircraft || [];
     state.source = data.source;
+    state.allProvidersEmpty = Boolean(data.allProvidersEmpty);
     state.error = null;
     state.lastFetch = Date.now();
     hideBanner();
@@ -874,7 +876,28 @@ function renderList() {
 
   const container = el("list");
   if (!list.length) {
-    container.innerHTML = `<p class="empty">Nothing in range right now. Widen the radius or loosen the filters.</p>`;
+    // "Nothing nearby" has several very different causes and they need
+    // telling apart: the wrong ones are silently wrong, and you cannot tell
+    // which you are looking at from an empty list.
+    let why;
+    if (state.aircraft.length) {
+      const hidden = state.aircraft.length;
+      why = `<b>${hidden} aircraft nearby</b>, all hidden by your filters. Check the "Show" boxes in settings.`;
+    } else if (!state.position) {
+      why = "Waiting for a location fix. Nothing can be looked up until the phone reports where it is.";
+    } else if (state.error) {
+      why = `Could not reach the aircraft feed: ${escapeHtml(state.error)}`;
+    } else {
+      const where = `${state.position.lat.toFixed(3)}, ${state.position.lon.toFixed(3)}`;
+      const src = state.positionSource === "gps" ? "GPS" : "a saved location";
+      why =
+        `No aircraft within ${state.settings.radius} NM of ${where}, searched using ${src}.` +
+        (state.allProvidersEmpty
+          ? " All three feeds agree, so this is a real coverage gap rather than one feed misbehaving."
+          : "") +
+        " If you can see aircraft, check that location looks right.";
+    }
+    container.innerHTML = `<p class="empty">${why}</p>`;
     return;
   }
 
@@ -1258,6 +1281,7 @@ async function main() {
   await loadAirlines();
 
   if (state.position) {
+    state.positionSource = "saved";
     el("locStatus").textContent = "Last known location";
     el("locStatus").className = "chip warn";
     refresh(true);

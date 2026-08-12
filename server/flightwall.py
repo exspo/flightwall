@@ -301,6 +301,7 @@ def get_aircraft(lat: float, lon: float, radius: float) -> dict:
         return {**cached, "cached": True}
 
     errors = []
+    empty_result = None  # a provider that answered cleanly but saw nothing
     for provider in PROVIDERS:
         url = provider["url"].format(lat=f"{lat:.4f}", lon=f"{lon:.4f}", radius=int(radius))
         started = time.time()
@@ -312,7 +313,21 @@ def get_aircraft(lat: float, lon: float, radius: float) -> dict:
             note_provider(provider["name"], False, detail)
             continue
 
-        rows = raw.get("ac") or raw.get("aircraft") or []
+        # "Key present but empty" means a genuinely quiet sky. "Key absent"
+        # means this is not the response we think it is - a rate-limit notice,
+        # an error object, a changed API - and reporting it as zero aircraft
+        # would quietly claim there is nothing overhead when there is.
+        if isinstance(raw, dict) and isinstance(raw.get("ac"), list):
+            rows = raw["ac"]
+        elif isinstance(raw, dict) and isinstance(raw.get("aircraft"), list):
+            rows = raw["aircraft"]
+        else:
+            shape = ", ".join(sorted(raw)[:6]) if isinstance(raw, dict) else type(raw).__name__
+            detail = f"no aircraft list in response (got: {shape})"
+            errors.append(f"{provider['name']}: {detail}")
+            note_provider(provider["name"], False, detail)
+            continue
+
         aircraft = [n for n in (normalize(r, lat, lon) for r in rows) if n]
         aircraft.sort(key=lambda a: a["dst"])
         note_provider(provider["name"], True, f"{len(aircraft)} aircraft in {time.time() - started:.2f}s")
@@ -324,8 +339,22 @@ def get_aircraft(lat: float, lon: float, radius: float) -> dict:
             "center": {"lat": lat, "lon": lon, "radius": radius},
             "errors": errors,
         }
+
+        # An empty sky is possible but unusual, and it looks identical to a
+        # provider having a bad day. Ask the next one before believing it;
+        # only if they all agree is the sky really empty.
+        if not aircraft:
+            empty_result = empty_result or result
+            errors.append(f"{provider['name']}: answered with zero aircraft")
+            continue
+
         aircraft_cache.set(key, result)
         return {**result, "cached": False}
+
+    if empty_result is not None:
+        empty_result = {**empty_result, "errors": errors, "allProvidersEmpty": True}
+        aircraft_cache.set(key, empty_result)
+        return {**empty_result, "cached": False}
 
     raise RuntimeError("; ".join(errors) or "no providers configured")
 

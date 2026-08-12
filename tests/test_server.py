@@ -274,6 +274,56 @@ class RouteTests(unittest.TestCase):
         self.assertTrue(out["errors"])
 
 
+class EmptyFeedTests(unittest.TestCase):
+    """A quiet sky and a misbehaving provider look identical from one
+    response. Reporting "nothing overhead" when there is something is the
+    worst outcome, so both get checked against the other providers."""
+
+    def setUp(self):
+        flightwall.aircraft_cache._data.clear()
+        self._real = flightwall.fetch_json
+
+    def tearDown(self):
+        flightwall.fetch_json = self._real
+
+    def test_response_without_an_aircraft_list_is_a_failure_not_zero(self):
+        # A rate-limit notice or an error object is valid JSON and has no
+        # aircraft in it; treating that as "sky is empty" hides real traffic.
+        calls = []
+
+        def fake(url, payload=None, timeout=8.0):
+            calls.append(url)
+            if "adsb.lol" in url:
+                return {"message": "rate limited", "retry": 30}
+            return SAMPLE
+
+        flightwall.fetch_json = fake
+        result = flightwall.get_aircraft(*ORD, 60)
+        self.assertEqual(result["source"], "adsb.fi")
+        self.assertTrue(result["aircraft"])
+        self.assertTrue(any("no aircraft list" in e for e in result["errors"]))
+
+    def test_a_provider_seeing_nothing_defers_to_one_that_does(self):
+        def fake(url, payload=None, timeout=8.0):
+            return {"ac": []} if "adsb.lol" in url else SAMPLE
+
+        flightwall.fetch_json = fake
+        result = flightwall.get_aircraft(*ORD, 60)
+        self.assertEqual(result["source"], "adsb.fi")
+        self.assertEqual(len(result["aircraft"]), 5)
+
+    def test_a_genuinely_empty_sky_is_still_reported(self):
+        flightwall.fetch_json = lambda *a, **k: {"ac": []}
+        result = flightwall.get_aircraft(*ORD, 60)
+        self.assertEqual(result["aircraft"], [])
+        self.assertTrue(result["allProvidersEmpty"])
+
+    def test_a_list_response_is_not_mistaken_for_aircraft(self):
+        flightwall.fetch_json = lambda *a, **k: ["unexpected"]
+        with self.assertRaises(RuntimeError):
+            flightwall.get_aircraft(*ORD, 60)
+
+
 class RoutePlausibilityTests(unittest.TestCase):
     """Route records are keyed on flight number and go stale. The aircraft is
     broadcasting where it really is, so that is the arbiter."""
