@@ -106,6 +106,7 @@ class FailoverTests(unittest.TestCase):
     def setUp(self):
         self.calls = []
         flightwall.aircraft_cache._data.clear()
+        flightwall.note_preferred(None)  # provider preference is global state
         self._real = flightwall.fetch_json
 
     def tearDown(self):
@@ -281,10 +282,12 @@ class EmptyFeedTests(unittest.TestCase):
 
     def setUp(self):
         flightwall.aircraft_cache._data.clear()
+        flightwall.note_preferred(None)  # provider preference is global state
         self._real = flightwall.fetch_json
 
     def tearDown(self):
         flightwall.fetch_json = self._real
+        flightwall.note_preferred(None)
 
     def test_response_without_an_aircraft_list_is_a_failure_not_zero(self):
         # A rate-limit notice or an error object is valid JSON and has no
@@ -317,6 +320,27 @@ class EmptyFeedTests(unittest.TestCase):
         result = flightwall.get_aircraft(*ORD, 60)
         self.assertEqual(result["aircraft"], [])
         self.assertTrue(result["allProvidersEmpty"])
+
+    def test_the_working_provider_is_tried_first_next_time(self):
+        # A feed can stay up and fast while returning nothing for days.
+        # Asking it first every time adds a wasted round trip to every refresh.
+        flightwall.note_preferred(None)
+        order = []
+
+        def fake(url, payload=None, timeout=8.0):
+            order.append(url)
+            return {"ac": []} if "adsb.lol" in url else SAMPLE
+
+        flightwall.fetch_json = fake
+        flightwall.get_aircraft(*ORD, 60)
+        self.assertEqual(len(order), 2, "adsb.lol first, then adsb.fi")
+
+        order.clear()
+        flightwall.aircraft_cache._data.clear()
+        flightwall.get_aircraft(*ORD, 60)
+        self.assertEqual(len(order), 1, "the feed that worked should be tried first")
+        self.assertIn("adsb.fi", order[0])
+        flightwall.note_preferred(None)
 
     def test_a_list_response_is_not_mistaken_for_aircraft(self):
         flightwall.fetch_json = lambda *a, **k: ["unexpected"]

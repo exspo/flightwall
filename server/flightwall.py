@@ -173,6 +173,31 @@ route_cache = TTLCache(ROUTE_TTL)
 landmark_cache = TTLCache(60 * 30, max_entries=256)
 provider_health: dict = {}
 _provider_lock = threading.Lock()
+# Whichever feed last actually produced aircraft. A provider can stay up and
+# fast while returning nothing useful for days, and asking it first every time
+# just adds a wasted round trip to every refresh.
+_preferred_provider: str | None = None
+
+
+def provider_order() -> list:
+    """Providers, best-known-good first, otherwise in configured order.
+
+    Self-correcting in both directions: a feed that goes quiet stops being
+    asked first, and the moment it produces aircraft again it is preferred
+    again. Nothing to edit when an upstream recovers.
+    """
+    with _provider_lock:
+        preferred = _preferred_provider
+    if not preferred:
+        return list(PROVIDERS)
+    # sorted() is stable, so everything else keeps its configured order.
+    return sorted(PROVIDERS, key=lambda p: 0 if p["name"] == preferred else 1)
+
+
+def note_preferred(name: str) -> None:
+    global _preferred_provider
+    with _provider_lock:
+        _preferred_provider = name
 
 
 def note_provider(name: str, ok: bool, detail: str = "") -> None:
@@ -302,7 +327,7 @@ def get_aircraft(lat: float, lon: float, radius: float) -> dict:
 
     errors = []
     empty_result = None  # a provider that answered cleanly but saw nothing
-    for provider in PROVIDERS:
+    for provider in provider_order():
         url = provider["url"].format(lat=f"{lat:.4f}", lon=f"{lon:.4f}", radius=int(radius))
         started = time.time()
         try:
@@ -348,6 +373,7 @@ def get_aircraft(lat: float, lon: float, radius: float) -> dict:
             errors.append(f"{provider['name']}: answered with zero aircraft")
             continue
 
+        note_preferred(provider["name"])
         aircraft_cache.set(key, result)
         return {**result, "cached": False}
 
