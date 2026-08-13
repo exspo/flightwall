@@ -536,6 +536,39 @@ def route_is_plausible(entry: dict, lat, lon) -> bool:
     return False
 
 
+ROUTE_CANDIDATES = {
+    "adsb.lol": lambda cs: (ROUTE_URL, {"planes": [{"callsign": cs, "lat": 0, "lng": 0}]}),
+    "adsbdb.com": lambda cs: (ADSBDB_URL.format(callsign=urllib.parse.quote(cs)), None),
+    "hexdb.io": lambda cs: (f"https://hexdb.io/api/v1/route/icao/{urllib.parse.quote(cs)}", None),
+}
+
+
+def check_routes(callsigns: list) -> int:
+    """Ask every known route source about the same callsigns and print what
+    each one says, verbatim.
+
+    Route data is the one part of this app with no way to tell right from
+    wrong on its own - a stale record looks exactly like a good one. This
+    exists so a source can be judged on real output rather than on its
+    documentation.
+    """
+    for callsign in callsigns:
+        callsign = callsign.strip().upper()
+        print(f"\n{callsign}")
+        print("-" * (len(callsign) + 2))
+        for name, build in ROUTE_CANDIDATES.items():
+            url, payload = build(callsign)
+            try:
+                raw = fetch_json(url, payload=payload, timeout=12.0)
+            except Exception as exc:  # noqa: BLE001 - this is a diagnostic
+                print(f"  {name:<12} FAILED  {type(exc).__name__}: {exc}")
+                continue
+            body = json.dumps(raw, separators=(",", ":"))
+            print(f"  {name:<12} {body[:400]}{'…' if len(body) > 400 else ''}")
+    print()
+    return 0
+
+
 def get_routes(planes: list) -> dict:
     """Resolve callsigns to ORD-LAX style routes. ADS-B never carries the route,
     so this is a separate lookup, and it is very cacheable.
@@ -545,71 +578,87 @@ def get_routes(planes: list) -> dict:
     showing a spinner forever.
     """
     errors = []
-    out, unknown = {}, []
+    out = {}
+    positions = {}
+    unknown = []
+
     for plane in planes:
         callsign = (plane.get("callsign") or "").strip().upper()
         if not callsign:
             continue
+        lat = to_number(plane.get("lat"))
+        lon = to_number(plane.get("lng"))
+        if lon is None:
+            lon = to_number(plane.get("lon"))
+        positions[callsign] = (lat, lon)
+
         cached = route_cache.get(callsign)
         if cached is not None:
             out[callsign] = cached
         else:
-            unknown.append({
-                "callsign": callsign,
-                "lat": to_number(plane.get("lat")) or 0,
-                "lng": to_number(plane.get("lng")) or to_number(plane.get("lon")) or 0,
-            })
+            unknown.append({"callsign": callsign, "lat": lat or 0, "lng": lon or 0})
 
     for batch_start in range(0, len(unknown), 100):
         batch = unknown[batch_start:batch_start + 100]
-        found = None
+        pending = {p["callsign"]: p for p in batch}
+        rejected = {}  # answers contradicted by the aircraft's own position
+        answered = False
+
         for name, lookup in ROUTE_PROVIDERS:
+            if not pending:
+                break
             try:
-                found = lookup(batch)
+                found = lookup(list(pending.values()))
             except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
                 detail = f"{name}: {type(exc).__name__}: {exc}"
                 errors.append(detail)
                 note_provider("routes", False, detail)
                 continue
-            note_provider("routes", True, f"{name} resolved {len(found)} of {len(batch)}")
-            break
 
-        if found is None:
-            # Every provider failed. Do not negative-cache: that would hide the
-            # callsign behind a "no route on file" for the next half hour.
+            answered = True
+            accepted = 0
+            for callsign, entry in found.items():
+                plane = pending.get(callsign)
+                if plane is None:
+                    continue
+                if not entry:
+                    # This source does not know it. Another one might, so leave
+                    # the callsign pending rather than settling for nothing.
+                    continue
+                if not route_is_plausible(entry, plane["lat"], plane["lng"]):
+                    # A wrong answer is not an answer. Hold on to it in case
+                    # every source is wrong, but keep asking.
+                    rejected[callsign] = entry
+                    continue
+                out[callsign] = entry
+                route_cache.set(callsign, entry, ttl=ROUTE_TTL)
+                pending.pop(callsign, None)
+                accepted += 1
+            note_provider("routes", True, f"{name} resolved {accepted} of {len(batch)}")
+
+        if not answered:
+            # Every provider errored. Do not negative-cache: that would hide
+            # the callsign behind "no route on file" for the next half hour.
             continue
 
-        for callsign, entry in found.items():
-            route_cache.set(callsign, entry, ttl=ROUTE_TTL if entry else 60 * 60)
-            out[callsign] = entry
+        for callsign in pending:
+            if callsign in rejected:
+                # Every source that had an answer was contradicted by the
+                # aircraft's position. Report the best of a bad set, flagged.
+                entry = {**rejected[callsign], "suspect": True}
+                out[callsign] = entry
+                route_cache.set(callsign, entry, ttl=60 * 60)
+            else:
+                out[callsign] = None
+                route_cache.set(callsign, None, ttl=60 * 30)
 
-        # Negative-cache the ones the provider simply did not answer for, so we
-        # stop asking about them on every refresh.
-        for plane in batch:
-            if plane["callsign"] not in found:
-                route_cache.set(plane["callsign"], None, ttl=60 * 30)
-                out[plane["callsign"]] = None
-
-    # Verify against where each aircraft actually is, every time rather than
-    # once at cache-fill: the same cached record is plausible early in a flight
-    # and absurd later, and only the live position can tell the difference.
-    positions = {}
-    for plane in planes:
-        callsign = (plane.get("callsign") or "").strip().upper()
-        if callsign:
-            positions[callsign] = (
-                to_number(plane.get("lat")),
-                to_number(plane.get("lng")) if plane.get("lng") is not None else to_number(plane.get("lon")),
-            )
-
+    # Cached entries were checked against wherever the aircraft was when the
+    # record was first fetched, which is not where it is now.
     for callsign, entry in list(out.items()):
-        if not entry:
+        if not entry or entry.get("suspect"):
             continue
         lat, lon = positions.get(callsign, (None, None))
         if not route_is_plausible(entry, lat, lon):
-            # Hand it back flagged rather than silently dropping it, so the
-            # phone can say which record it distrusted instead of implying no
-            # route exists.
             out[callsign] = {**entry, "suspect": True}
 
     return {"routes": out, "errors": errors}
@@ -836,7 +885,14 @@ def main() -> int:
     parser.add_argument("--key", default=str(STATE / "key.pem"))
     parser.add_argument("--no-auth", action="store_true", help="drop the token check (LAN only)")
     parser.add_argument("--demo", action="store_true", help="synthetic traffic, no network needed")
+    parser.add_argument(
+        "--check-routes", nargs="+", metavar="CALLSIGN",
+        help="ask every route source about these callsigns and print the raw answers",
+    )
     args = parser.parse_args()
+
+    if args.check_routes:
+        return check_routes(args.check_routes)
 
     if args.demo:
         import demo_feed

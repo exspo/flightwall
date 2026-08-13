@@ -395,6 +395,75 @@ class RoutePlausibilityTests(unittest.TestCase):
         self.assertTrue(flightwall.route_is_plausible(entry, *self.CHARLOTTESVILLE))
         self.assertTrue(flightwall.route_is_plausible({"airports": [self.PHL, self.ALB]}, None, None))
 
+    def test_a_wrong_answer_makes_it_ask_the_next_source(self):
+        # A provider that returns a confidently wrong route was previously
+        # treated as success, so the better source was never consulted.
+        real = flightwall.fetch_json
+        flightwall.route_cache._data.clear()
+        asked = []
+        try:
+            def fake(url, payload=None, timeout=8.0):
+                asked.append(url)
+                if "adsb.lol" in url:
+                    return [{
+                        "callsign": "DAL970", "_airport_codes_iata": "MSP-PDX",
+                        "plausible": 1, "airline_code": "DAL",
+                        "_airports": [
+                            {"iata": "MSP", "lat": 44.8820, "lon": -93.2218},
+                            {"iata": "PDX", "lat": 45.5887, "lon": -122.5975},
+                        ],
+                    }]
+                return {"response": {"flightroute": {
+                    "callsign": "DAL970", "airline": {"icao": "DAL"},
+                    "origin": {"iata_code": "ATL", "latitude": 33.6367, "longitude": -84.4281},
+                    "destination": {"iata_code": "JFK", "latitude": 40.6398, "longitude": -73.7789},
+                }}}
+
+            flightwall.fetch_json = fake
+            # Over Virginia: MSP-PDX is impossible, ATL-JFK passes right over.
+            out = flightwall.get_routes([{"callsign": "DAL970", "lat": 38.03, "lng": -78.48}])
+        finally:
+            flightwall.fetch_json = real
+
+        entry = out["routes"]["DAL970"]
+        self.assertEqual(entry["route"], "ATL-JFK", "should prefer the source that fits")
+        self.assertNotIn("suspect", entry)
+        self.assertTrue(any("adsbdb" in a for a in asked), "the second source must be tried")
+
+    def test_all_sources_wrong_still_reports_the_best_available(self):
+        real = flightwall.fetch_json
+        flightwall.route_cache._data.clear()
+        try:
+            flightwall.fetch_json = lambda url, payload=None, timeout=8.0: (
+                [{
+                    "callsign": "DAL970", "_airport_codes_iata": "MSP-PDX", "plausible": 1,
+                    "_airports": [
+                        {"iata": "MSP", "lat": 44.8820, "lon": -93.2218},
+                        {"iata": "PDX", "lat": 45.5887, "lon": -122.5975},
+                    ],
+                }] if "adsb.lol" in url else {"response": "unknown callsign"}
+            )
+            out = flightwall.get_routes([{"callsign": "DAL970", "lat": 38.03, "lng": -78.48}])
+        finally:
+            flightwall.fetch_json = real
+        self.assertTrue(out["routes"]["DAL970"]["suspect"])
+
+    def test_a_source_that_does_not_know_defers_to_one_that_does(self):
+        real = flightwall.fetch_json
+        flightwall.route_cache._data.clear()
+        try:
+            flightwall.fetch_json = lambda url, payload=None, timeout=8.0: (
+                [] if "adsb.lol" in url else {"response": {"flightroute": {
+                    "callsign": "DAL970", "airline": {"icao": "DAL"},
+                    "origin": {"iata_code": "ATL", "latitude": 33.6367, "longitude": -84.4281},
+                    "destination": {"iata_code": "JFK", "latitude": 40.6398, "longitude": -73.7789},
+                }}}
+            )
+            out = flightwall.get_routes([{"callsign": "DAL970", "lat": 38.03, "lng": -78.48}])
+        finally:
+            flightwall.fetch_json = real
+        self.assertEqual(out["routes"]["DAL970"]["route"], "ATL-JFK")
+
     def test_get_routes_flags_rather_than_drops(self):
         real = flightwall.fetch_json
         flightwall.route_cache._data.clear()

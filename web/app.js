@@ -1043,11 +1043,12 @@ function renderRoute() {
   const message = !airline
     ? "Flying under a tail number rather than an airline callsign, so there is no filed route to look up."
     : suspect
-    // Naming the rejected route matters: it is usually recognisable as an old
-    // schedule, and it makes the judgement checkable rather than mysterious.
-    ? `The route on file for <b>${escapeHtml(ac.flight)}</b> is <b>${escapeHtml(
+    // Short, because on a bad day this appears on every aircraft. The rejected
+    // route is still named, since it is usually recognisable as an old
+    // schedule and makes the judgement checkable.
+    ? `No reliable route — every source says <b>${escapeHtml(
         (suspect.route || "unknown").toUpperCase()
-      )}</b>, which does not pass anywhere near this aircraft. Treating it as a stale record and not showing it — tap the flight number for the live picture.`
+      )}</b>, which this aircraft is nowhere near. Tap the flight number for the live picture.`
     : state.routes.has(ac.flight)
     ? `No route on file for <b>${escapeHtml(ac.flight)}</b>.`
     : state.routeError
