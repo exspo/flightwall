@@ -116,6 +116,10 @@ CAT_GROUND = {"C1", "C2", "C3"}
 
 EMERGENCY_SQUAWKS = {"7500": "HIJACK", "7600": "RADIO FAIL", "7700": "EMERGENCY"}
 
+# Identifies this server process. Every deploy is a restart, so a change in
+# this value tells a long-running client its own code may be out of date.
+BOOT_ID = f"{int(time.time())}-{os.getpid()}"
+
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -394,6 +398,12 @@ def get_aircraft(lat: float, lon: float, radius: float) -> dict:
             "now": raw.get("now") or time.time() * 1000,
             "center": {"lat": lat, "lon": lon, "radius": radius},
             "errors": errors,
+            # Which server process answered. The phone compares this across
+            # polls and reloads itself when it changes, because a home-screen
+            # app resumes rather than reloading: after an update landed, a
+            # phone kept running week-old JavaScript against the new server,
+            # and taps quietly did nothing the new code was supposed to do.
+            "boot": BOOT_ID,
         }
 
         # An empty sky is possible but unusual, and it looks identical to a

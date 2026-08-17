@@ -82,6 +82,7 @@ const state = {
   liveWanted: null,
   liveAsked: new Set(),
   openedLive: false,
+  serverBoot: null,
   fetching: false,
   error: null,
   source: null,
@@ -400,6 +401,24 @@ async function refresh(force = false) {
     const res = await fetch(url, { credentials: "same-origin" });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
     const data = await res.json();
+    // A home-screen app resumes rather than reloading, so after a server
+    // update the page can keep running old code indefinitely - taps did
+    // nothing while looking like they worked. The server stamps each
+    // response with its process identity; when that changes mid-session,
+    // this page's code is suspect, so fetch the new version. Guarded so a
+    // flapping server cannot put the phone in a reload loop.
+    if (data.boot) {
+      if (state.serverBoot && data.boot !== state.serverBoot) {
+        const last = Number(sessionStorage.getItem("fw.reloadedAt") || 0);
+        if (Date.now() - last > 60_000) {
+          sessionStorage.setItem("fw.reloadedAt", String(Date.now()));
+          location.reload();
+          return;
+        }
+      }
+      state.serverBoot = data.boot;
+    }
+
     state.aircraft = data.aircraft || [];
     state.source = data.source;
     state.allProvidersEmpty = Boolean(data.allProvidersEmpty);
@@ -1250,6 +1269,19 @@ function bindControls() {
     // Picking an aircraft out of the list is the request for the real answer.
     requestLiveRoute(state.aircraft.find((ac) => ac.hex === state.pinned));
     // The highlight follows from drawBoard on the next frame.
+  });
+
+  // The board is the most natural thing on the page to tap, and it shows
+  // exactly one aircraft, so a tap can only mean one thing: that one, for
+  // real. Pin it so the answer stays put once it arrives.
+  el("board").addEventListener("click", () => {
+    const ac = focusedAircraft();
+    if (!ac) return;
+    state.pinned = ac.hex;
+    state.settings.focus = "pinned";
+    saveSettings();
+    syncControls();
+    requestLiveRoute(ac);
   });
 
   el("radar").addEventListener("click", (event) => {
