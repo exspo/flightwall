@@ -17,6 +17,7 @@ import argparse
 import json
 import math
 import os
+import re
 import secrets
 import ssl
 import subprocess
@@ -561,7 +562,13 @@ def _route_via_aeroapi(callsign: str) -> dict | None:
     if not key:
         return None
 
-    url = AEROAPI_URL.format(ident=urllib.parse.quote(callsign)) + "?ident_type=designator"
+    # An airline callsign is an operator code followed by a flight number
+    # (UAL2402); anything else on the board is a registration (N330JT).
+    # Telling FlightAware which it is got wrong answers for private aircraft,
+    # because a tail number is not a designator and it will not resolve one.
+    designator = bool(re.fullmatch(r"[A-Z]{3}\d{1,4}[A-Z]?", callsign))
+    ident_type = "designator" if designator else "registration"
+    url = f"{AEROAPI_URL.format(ident=urllib.parse.quote(callsign))}?ident_type={ident_type}"
     req = urllib.request.Request(url, headers={
         "User-Agent": USER_AGENT,
         "Accept": "application/json; charset=UTF-8",
@@ -732,6 +739,57 @@ def check_routes(callsigns: list) -> int:
     return 0
 
 
+def _codes_of(airport: dict) -> set:
+    return {c for c in (airport.get("icao"), airport.get("iata")) if c}
+
+
+def reconcile_with_trace(entry: dict, hex_id: str) -> dict | None:
+    """Judge a table route against where the aircraft actually took off.
+
+    The position check cannot tell a route from its own reverse: A-to-B and
+    B-to-A are the same line on the ground, so an aircraft flying the return
+    leg passes the check with its origin and destination swapped, and the
+    board shows the flight backwards with full confidence. Measured on live
+    traffic, that and outright wrong records account for the majority of the
+    routes that survive the geometric check.
+
+    The aircraft's own track history settles it, because a departure airport
+    is an observation:
+
+      matches the claimed origin       the record is right, keep it
+      matches the claimed destination  the aircraft is flying the return leg,
+                                       so reverse the record
+      matches neither                  the record is about a different flight
+
+    Returns the corrected entry, or None if the record cannot be salvaged.
+    """
+    stops = (entry or {}).get("airports") or []
+    if len(stops) < 2:
+        return entry
+
+    observed = airports.origin_from_trace(hex_id)
+    if not observed:
+        return entry  # nothing observed, so no opinion either way
+
+    seen = _codes_of(observed)
+    if not seen:
+        return entry
+
+    if seen & _codes_of(stops[0]):
+        return {**entry, "confidence": "trace-confirmed"}
+
+    if seen & _codes_of(stops[-1]):
+        flipped = list(reversed(stops))
+        return {
+            **entry,
+            "airports": flipped,
+            "route": "-".join(a.get("iata") or a.get("icao") or "?" for a in flipped),
+            "confidence": "trace-corrected",
+        }
+
+    return None
+
+
 def get_routes(planes: list, focus: str | None = None) -> dict:
     """Resolve callsigns to ORD-LAX style routes. ADS-B never carries the route,
     so this is a separate lookup, and it is very cacheable.
@@ -763,7 +821,7 @@ def get_routes(planes: list, focus: str | None = None) -> dict:
             except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
                 detail = f"aeroapi: {type(exc).__name__}: {exc}"
                 errors.append(detail)
-                note_provider("routes", False, detail)
+                note_provider("routes:live", False, detail)
                 confirmed = None
             else:
                 # Cache the miss too. A number FlightAware has no live flight
@@ -771,7 +829,7 @@ def get_routes(planes: list, focus: str | None = None) -> dict:
                 # ask costs real money.
                 route_cache.set(f"aero:{focus}", confirmed or False, ttl=AEROAPI_TTL)
                 if confirmed:
-                    note_provider("routes", True, "aeroapi resolved 1")
+                    note_provider("routes:live", True, f"resolved {focus}")
         else:
             confirmed = cached or None
         if confirmed:
@@ -861,6 +919,22 @@ def get_routes(planes: list, focus: str | None = None) -> dict:
         lat, lon = positions.get(callsign, (None, None))
         if not route_is_plausible(entry, lat, lon):
             out[callsign] = {**entry, "suspect": True}
+
+    # The aircraft on the board gets the stronger test. The geometric check
+    # above only proves a route is not absurd; the aircraft's own departure
+    # proves whether it is this flight, and which way round it is flying.
+    # Not applied to the whole list because each check costs a trace fetch.
+    if focus and out.get(focus) and out[focus].get("source") != "aeroapi":
+        hex_id = next(
+            ((p.get("hex") or "").strip().lower() for p in planes
+             if (p.get("callsign") or "").strip().upper() == focus and p.get("hex")),
+            None,
+        )
+        if hex_id:
+            settled = reconcile_with_trace(out[focus], hex_id)
+            # A record the aircraft contradicts outright is worse than a blank
+            # panel: the derived origin and destination will answer instead.
+            out[focus] = settled if settled else None
 
     return {"routes": out, "derived": derive(planes, focus), "errors": errors}
 
@@ -978,6 +1052,19 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "version": "1.0",
                 "providers": provider_health,
+                # Whether the live-flight tier is even switched on. Without
+                # this, a key that never loaded looks exactly like a key that
+                # loaded and found no flights, and the board looks the same
+                # either way: quietly falling back to the tables.
+                "aeroapi": {
+                    "configured": bool(aeroapi_key()),
+                    "source": (
+                        "env" if os.environ.get("FLIGHTWALL_AEROAPI_KEY")
+                        else "config.json" if aeroapi_key()
+                        else None
+                    ),
+                },
+                "airports": airports.loaded(),
                 "auth": bool(self.token),
                 "time": time.time(),
             })

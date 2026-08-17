@@ -358,6 +358,118 @@ class AeroApiTests(unittest.TestCase):
         self.assertEqual(out["errors"], [])
 
 
+class TraceReconciliationTests(unittest.TestCase):
+    """The geometric check cannot tell a route from its own reverse, because
+    A-to-B and B-to-A are the same line. Measured on live traffic, 62% of the
+    table routes that passed that check still had the wrong origin, and the
+    commonest case was an aircraft flying the return leg. Where it took off
+    is an observation, so it settles the question."""
+
+    ATL = {"iata": "ATL", "icao": "KATL", "lat": 33.6367, "lon": -84.4281}
+    PHL = {"iata": "PHL", "icao": "KPHL", "lat": 39.8719, "lon": -75.2411}
+
+    def setUp(self):
+        self._real = flightwall.airports.origin_from_trace
+
+    def tearDown(self):
+        flightwall.airports.origin_from_trace = self._real
+
+    def _entry(self):
+        return {"route": "ATL-PHL", "airports": [dict(self.ATL), dict(self.PHL)]}
+
+    def _observed(self, code):
+        flightwall.airports.origin_from_trace = lambda h: (
+            {"iata": code, "icao": "K" + code} if code else None
+        )
+
+    def test_matching_origin_confirms_the_record(self):
+        self._observed("ATL")
+        out = flightwall.reconcile_with_trace(self._entry(), "abc123")
+        self.assertEqual(out["route"], "ATL-PHL")
+        self.assertEqual(out["confidence"], "trace-confirmed")
+
+    def test_a_return_leg_is_reversed_rather_than_shown_backwards(self):
+        # The aircraft took off from the claimed destination, so the table has
+        # the right pair and the wrong direction.
+        self._observed("PHL")
+        out = flightwall.reconcile_with_trace(self._entry(), "abc123")
+        self.assertEqual(out["route"], "PHL-ATL")
+        self.assertEqual(out["airports"][0]["iata"], "PHL")
+        self.assertEqual(out["airports"][-1]["iata"], "ATL")
+        self.assertEqual(out["confidence"], "trace-corrected")
+
+    def test_an_unrelated_departure_kills_the_record(self):
+        # Neither end matches, so the table is describing a different flight.
+        self._observed("DEN")
+        self.assertIsNone(flightwall.reconcile_with_trace(self._entry(), "abc123"))
+
+    def test_no_trace_leaves_the_record_alone(self):
+        # Absence of evidence is not evidence; the geometric check still stands.
+        self._observed(None)
+        out = flightwall.reconcile_with_trace(self._entry(), "abc123")
+        self.assertEqual(out["route"], "ATL-PHL")
+        self.assertNotIn("confidence", out)
+
+    def test_only_the_focused_aircraft_is_reconciled(self):
+        asked = []
+        flightwall.airports.origin_from_trace = lambda h: asked.append(h)
+        real = flightwall.fetch_json
+        flightwall.route_cache._data.clear()
+        flightwall.fetch_json = lambda *a, **k: {"response": {"flightroute": {
+            "callsign": "DAL926", "airline": {"icao": "DAL"},
+            "origin": {"iata_code": "ATL", "latitude": 33.6367, "longitude": -84.4281},
+            "destination": {"iata_code": "PHL", "latitude": 39.8719, "longitude": -75.2411},
+        }}}
+        try:
+            flightwall.get_routes([
+                {"callsign": "DAL926", "lat": 37.0, "lng": -79.0, "hex": "aaa001"},
+                {"callsign": "DAL927", "lat": 37.1, "lng": -79.1, "hex": "bbb002"},
+            ], focus="DAL926")
+        finally:
+            flightwall.fetch_json = real
+        # aaa001 twice: once reconciling the route, once deriving its origin.
+        self.assertEqual(set(asked), {"aaa001"})
+
+
+class AeroApiIdentTypeTests(unittest.TestCase):
+    """A tail number is not a designator, and FlightAware will not resolve one
+    if it is told the wrong type."""
+
+    def setUp(self):
+        self._key = flightwall.aeroapi_key
+        self._open = flightwall.urllib.request.urlopen
+        flightwall.aeroapi_key = lambda: "test-key"
+        self.urls = []
+
+        class Resp:
+            def read(self):
+                return json.dumps({"flights": []}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def spy(req, *a, **k):
+            self.urls.append(req.full_url)
+            return Resp()
+
+        flightwall.urllib.request.urlopen = spy
+
+    def tearDown(self):
+        flightwall.aeroapi_key = self._key
+        flightwall.urllib.request.urlopen = self._open
+
+    def test_airline_callsign_is_a_designator(self):
+        flightwall._route_via_aeroapi("UAL2402")
+        self.assertIn("ident_type=designator", self.urls[0])
+
+    def test_tail_number_is_a_registration(self):
+        flightwall._route_via_aeroapi("N330JT")
+        self.assertIn("ident_type=registration", self.urls[0])
+
+
 class DerivedTests(unittest.TestCase):
     """What the aircraft says about itself. No route table involved, so
     nothing here can go stale."""
