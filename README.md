@@ -157,10 +157,15 @@ indefinitely. Sampling 70 aircraft overhead in August 2026: adsbdb answered for
 was. The same callsign frequently resolves to three different routes depending
 which table you ask.
 
-So every table record is checked against the aircraft's own broadcast position.
-If the aircraft is nowhere near the claimed path the route is withheld.
-Multi-leg routes are checked leg by leg, and the tolerance is generous, since
-real flights hold and get vectored around weather.
+So table records are held to what the aircraft can verify. Every record is
+checked against the broadcast position, and the one on the board gets two
+stronger tests: its origin must match where the aircraft actually took off,
+and if the aircraft is measurably descending toward some other field, the
+record's destination loses. A record that fails is dropped rather than
+patched — a reused number flies several legs a day, and departing the
+recorded destination proves the record is the wrong leg, not the same leg
+backwards. What survives on screen is the observed departure and, once the
+descent starts, the observed arrival.
 
 **The aircraft itself**, which cannot go stale because it is an observation
 rather than a record. Its 24 hours of track history is rewound to the last time

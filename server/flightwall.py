@@ -805,12 +805,22 @@ def reconcile_with_trace(entry: dict, hex_id: str) -> dict | None:
     The aircraft's own track history settles it, because a departure airport
     is an observation:
 
-      matches the claimed origin       the record is right, keep it
-      matches the claimed destination  the aircraft is flying the return leg,
-                                       so reverse the record
+      matches the claimed origin       the origin is right; the destination
+                                       is still only the table's word
+      matches the claimed destination  the record is some other leg of this
+                                       number's day, so drop it
       matches neither                  the record is about a different flight
 
-    Returns the corrected entry, or None if the record cannot be salvaged.
+    An earlier version treated the second case as a return leg and reversed
+    the record. That manufactured destinations: SWA569's table entry was
+    BOS-BNA, the aircraft departed BNA, and the flip produced BNA-BOS while
+    the flight was actually BNA-RIC - numbers like Southwest's fly several
+    legs a day, and departing the recorded destination proves the record is
+    the wrong leg, not the same leg backwards. The trace proves where an
+    aircraft took off. It proves nothing about where it is going, and half an
+    observation must not dress up a guess.
+
+    Returns the entry, or None if the record cannot be trusted.
     """
     stops = (entry or {}).get("airports") or []
     if len(stops) < 2:
@@ -826,15 +836,6 @@ def reconcile_with_trace(entry: dict, hex_id: str) -> dict | None:
 
     if seen & _codes_of(stops[0]):
         return {**entry, "confidence": "trace-confirmed"}
-
-    if seen & _codes_of(stops[-1]):
-        flipped = list(reversed(stops))
-        return {
-            **entry,
-            "airports": flipped,
-            "route": "-".join(a.get("iata") or a.get("icao") or "?" for a in flipped),
-            "confidence": "trace-corrected",
-        }
 
     return None
 
@@ -952,6 +953,8 @@ def get_routes(planes: list, focus: str | None = None, live: str | None = None) 
     # above only proves a route is not absurd; the aircraft's own departure
     # proves whether it is this flight, and which way round it is flying.
     # Not applied to the whole list because each check costs a trace fetch.
+    derived = derive(planes, focus)
+
     if focus:
         hex_id = next(
             ((p.get("hex") or "").strip().lower() for p in planes
@@ -964,6 +967,18 @@ def get_routes(planes: list, focus: str | None = None, live: str | None = None) 
             # panel: the derived origin and destination will answer instead.
             out[focus] = settled if settled else None
 
+        # A confirmed departure still says nothing about the arrival - a
+        # reused number's record can hold the right origin and a different
+        # leg's destination (VRS held BNA-MCO for a flight running BNA-RIC).
+        # The descent is the one arrival fact actually observed, so when the
+        # aircraft is measurably going somewhere else, the record loses.
+        entry = out.get(focus)
+        if entry and hex_id and entry.get("source") != "aeroapi":
+            inferred = (derived.get(hex_id) or {}).get("destination")
+            stops = entry.get("airports") or []
+            if inferred and stops and not (_codes_of(inferred) & _codes_of(stops[-1])):
+                out[focus] = None
+
     # A paid query happens only when the board is told to make one, never
     # because an aircraft happened to come round on the cycle. The client asks
     # for exactly one on open, for whatever is nearest, and one more each time
@@ -973,7 +988,7 @@ def get_routes(planes: list, focus: str | None = None, live: str | None = None) 
         if confirmed:
             out[live] = confirmed
 
-    return {"routes": out, "derived": derive(planes, focus), "errors": errors}
+    return {"routes": out, "derived": derived, "errors": errors}
 
 
 def _live_route(callsign: str, errors: list) -> dict | None:

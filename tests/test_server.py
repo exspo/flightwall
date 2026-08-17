@@ -446,15 +446,14 @@ class TraceReconciliationTests(unittest.TestCase):
         self.assertEqual(out["route"], "ATL-PHL")
         self.assertEqual(out["confidence"], "trace-confirmed")
 
-    def test_a_return_leg_is_reversed_rather_than_shown_backwards(self):
-        # The aircraft took off from the claimed destination, so the table has
-        # the right pair and the wrong direction.
+    def test_departing_the_claimed_destination_kills_the_record(self):
+        # An earlier build reversed these as "return legs" and manufactured
+        # destinations: SWA569's record said BOS-BNA, the aircraft departed
+        # BNA, the flip showed BNA-BOS - and the flight was BNA-RIC. A number
+        # that flies several legs a day makes the flip a guess, and the trace
+        # only ever proves the departure.
         self._observed("PHL")
-        out = flightwall.reconcile_with_trace(self._entry(), "abc123")
-        self.assertEqual(out["route"], "PHL-ATL")
-        self.assertEqual(out["airports"][0]["iata"], "PHL")
-        self.assertEqual(out["airports"][-1]["iata"], "ATL")
-        self.assertEqual(out["confidence"], "trace-corrected")
+        self.assertIsNone(flightwall.reconcile_with_trace(self._entry(), "abc123"))
 
     def test_an_unrelated_departure_kills_the_record(self):
         # Neither end matches, so the table is describing a different flight.
@@ -467,6 +466,33 @@ class TraceReconciliationTests(unittest.TestCase):
         out = flightwall.reconcile_with_trace(self._entry(), "abc123")
         self.assertEqual(out["route"], "ATL-PHL")
         self.assertNotIn("confidence", out)
+
+    def test_descent_toward_somewhere_else_beats_a_confirmed_record(self):
+        # The SWA569 class of failure with the origin RIGHT: VRS held BNA-MCO
+        # for a flight running BNA-RIC. Departure confirms only the origin;
+        # if the aircraft is measurably descending toward a different field,
+        # the record's destination is exposed as another leg's.
+        flightwall.airports.origin_from_trace = lambda h: {"iata": "ATL", "icao": "KATL"}
+        real = flightwall.fetch_json
+        flightwall.route_cache._data.clear()
+        flightwall.fetch_json = lambda *a, **k: {"response": {"flightroute": {
+            "callsign": "DAL926", "airline": {"icao": "DAL"},
+            "origin": {"iata_code": "ATL", "latitude": 33.6367, "longitude": -84.4281},
+            "destination": {"iata_code": "PHL", "latitude": 39.8719, "longitude": -75.2411},
+        }}}
+        try:
+            # 2,000 ft just south of Richmond, descending on a track that
+            # points at RIC - not at PHL.
+            out = flightwall.get_routes([{
+                "callsign": "DAL926", "hex": "aaa001",
+                "lat": 37.30, "lng": -77.40, "track": 15, "gs": 180,
+                "alt_baro": 2000, "baro_rate": -900,
+            }], focus="DAL926")
+        finally:
+            flightwall.fetch_json = real
+        self.assertIsNone(out["routes"]["DAL926"],
+                          "a record whose destination the descent contradicts must drop")
+        self.assertEqual(out["derived"]["aaa001"]["destination"]["iata"], "RIC")
 
     def test_only_the_focused_aircraft_is_reconciled(self):
         asked = []
