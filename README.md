@@ -132,9 +132,21 @@ trusted.
 
 **FlightAware**, if you have set up a key. This is the only source that knows
 what today's date is, so its answer is used as given and never second-guessed.
-It costs a query, so it is asked about one aircraft at a time — whichever the
-board is currently showing — and the answer is cached for six hours. Without a
-key this tier is simply skipped; nothing else changes.
+
+It is also the only source that costs money, and the board is exactly the wrong
+shape for that: in cycle mode it changes aircraft every nine seconds, and
+roughly 250 new callsigns an hour cross a 60nm circle. Querying whatever
+happened to be on screen would run to hundreds of dollars a month against a $5
+allowance. So a query is only ever spent because a person asked for a
+particular aircraft:
+
+- one when the app opens, for whatever is nearest
+- one more each time you tap an aircraft
+- nothing at all for cycling, and nothing for tapping the same aircraft twice
+
+Answers are cached for six hours, and a hard monthly cap (`AEROAPI_MONTHLY_CAP`,
+800 queries ≈ $4) stops spending dead if something ever loops. Without a key
+this tier is skipped entirely and nothing else changes.
 
 **The community route tables** — adsbdb.com and the VRS standing data behind
 adsb.lol — which are free and cost nothing to ask. They are also a flight

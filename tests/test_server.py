@@ -6,6 +6,7 @@
 
 import json
 import sys
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -275,12 +276,24 @@ class AeroApiTests(unittest.TestCase):
         self._key = flightwall.aeroapi_key
         self._fetch = flightwall.fetch_json
         self._open = flightwall.urllib.request.urlopen
+        self._trace = flightwall.airports.origin_from_trace
+        self._state = flightwall.STATE
+        self._cap = flightwall.AEROAPI_MONTHLY_CAP
+        # The spend counter lives on disk. Point it somewhere disposable so a
+        # test run cannot touch the real allowance record.
+        self._tmp = tempfile.TemporaryDirectory()
+        flightwall.STATE = Path(self._tmp.name)
         flightwall.aeroapi_key = lambda: "test-key"
+        flightwall.airports.origin_from_trace = lambda h: None
 
     def tearDown(self):
         flightwall.aeroapi_key = self._key
         flightwall.fetch_json = self._fetch
         flightwall.urllib.request.urlopen = self._open
+        flightwall.airports.origin_from_trace = self._trace
+        flightwall.STATE = self._state
+        flightwall.AEROAPI_MONTHLY_CAP = self._cap
+        self._tmp.cleanup()
 
     def _serve(self, payload):
         class Resp:
@@ -295,22 +308,64 @@ class AeroApiTests(unittest.TestCase):
 
         flightwall.urllib.request.urlopen = lambda *a, **k: Resp()
 
-    def test_airborne_flight_wins_over_the_static_tables(self):
+    def test_a_live_answer_overrides_whatever_the_tables_said(self):
         self._serve({"flights": [
             {"ident": "ENY3390", "actual_off": "2026-08-17T12:00:00Z", "actual_on": None,
              "operator_icao": "ENY", "flight_number": "3390", "progress_percent": 80,
              "status": "En Route", "origin": {"code_icao": "KCLT", "code_iata": "CLT"},
              "destination": {"code_icao": "KCHO", "code_iata": "CHO"}},
         ]})
-        # The tables would say something else entirely; they must not be asked.
-        flightwall.fetch_json = lambda *a, **k: self.fail("tables queried despite a live answer")
+        flightwall.fetch_json = lambda *a, **k: {"response": {"flightroute": {
+            "callsign": "ENY3390", "airline": {"icao": "ENY"},
+            "origin": {"iata_code": "EYW", "latitude": 24.5561, "longitude": -81.7596},
+            "destination": {"iata_code": "ORD", "latitude": 41.9786, "longitude": -87.9048},
+        }}}
         out = flightwall.get_routes(
-            [{"callsign": "ENY3390", "lat": 38.0, "lng": -78.5}], focus="ENY3390")
+            [{"callsign": "ENY3390", "lat": 38.0, "lng": -78.5}], live="ENY3390")
         entry = out["routes"]["ENY3390"]
         self.assertEqual(entry["route"], "CLT-CHO")
         self.assertEqual(entry["source"], "aeroapi")
         self.assertEqual(entry["confidence"], "confirmed")
         self.assertNotIn("suspect", entry)
+
+    def test_cycling_past_an_aircraft_costs_nothing(self):
+        # The whole point of `live`: focus moves every nine seconds and must
+        # never spend a query on its own.
+        def forbidden(*a, **k):
+            raise AssertionError("aeroapi called without an explicit request")
+
+        flightwall.urllib.request.urlopen = forbidden
+        flightwall.airports.origin_from_trace = lambda h: None
+        flightwall.fetch_json = lambda *a, **k: {"response": "unknown callsign"}
+        flightwall.get_routes(
+            [{"callsign": "AAA1", "lat": 38.0, "lng": -78.5, "hex": "a00001"}],
+            focus="AAA1")
+        self.assertEqual(flightwall.aeroapi_usage()["queries"], 0)
+
+    def test_the_monthly_cap_stops_spending(self):
+        self._serve({"flights": [
+            {"actual_off": "2026-08-17T12:00:00Z", "actual_on": None,
+             "origin": {"code_icao": "KATL"}, "destination": {"code_icao": "KMSP"}},
+        ]})
+        flightwall.fetch_json = lambda *a, **k: {"response": "unknown callsign"}
+        flightwall.AEROAPI_MONTHLY_CAP = 2
+        for n in range(4):
+            flightwall.route_cache._data.clear()   # force a real lookup each time
+            flightwall.get_routes([{"callsign": f"DAL{n}", "lat": 39.0, "lng": -88.8}],
+                                  live=f"DAL{n}")
+        self.assertEqual(flightwall.aeroapi_usage()["queries"], 2,
+                         "spending must stop dead at the cap, not merely slow down")
+
+    def test_a_repeat_request_is_served_from_cache_not_bought_again(self):
+        self._serve({"flights": [
+            {"actual_off": "2026-08-17T12:00:00Z", "actual_on": None,
+             "origin": {"code_icao": "KATL"}, "destination": {"code_icao": "KMSP"}},
+        ]})
+        flightwall.fetch_json = lambda *a, **k: {"response": "unknown callsign"}
+        for _ in range(3):
+            flightwall.get_routes([{"callsign": "DAL926", "lat": 39.0, "lng": -88.8}],
+                                  live="DAL926")
+        self.assertEqual(flightwall.aeroapi_usage()["queries"], 1)
 
     def test_coordinates_are_filled_from_the_local_airport_table(self):
         self._serve({"flights": [
@@ -328,34 +383,37 @@ class AeroApiTests(unittest.TestCase):
         ]})
         self.assertIsNone(flightwall._route_via_aeroapi("DAL926"))
 
-    def test_only_the_focused_aircraft_costs_a_query(self):
+    def test_only_the_requested_aircraft_costs_a_query(self):
         asked = []
         real_lookup = flightwall._route_via_aeroapi
-        real_trace = flightwall.airports.origin_from_trace
 
         def spy(ident):
             asked.append(ident)
             return None
 
         flightwall._route_via_aeroapi = spy
-        flightwall.airports.origin_from_trace = lambda h: None  # keep the suite offline
         flightwall.fetch_json = lambda *a, **k: {"response": "unknown callsign"}
         try:
             flightwall.get_routes([
                 {"callsign": "AAA1", "lat": 38.0, "lng": -78.5, "hex": "a00001"},
                 {"callsign": "BBB2", "lat": 38.1, "lng": -78.6, "hex": "a00002"},
-            ], focus="AAA1")
+            ], focus="BBB2", live="AAA1")
         finally:
             flightwall._route_via_aeroapi = real_lookup
-            flightwall.airports.origin_from_trace = real_trace
+        # BBB2 is the one on screen; AAA1 is the one somebody asked about.
         self.assertEqual(asked, ["AAA1"])
 
     def test_no_key_is_a_normal_state_not_an_error(self):
+        # Asked for a live answer with no key configured: the tier is skipped
+        # silently and nothing is spent, rather than surfacing an error the
+        # owner cannot act on.
         flightwall.aeroapi_key = lambda: None
+        flightwall.urllib.request.urlopen = lambda *a, **k: self.fail("called with no key")
         flightwall.fetch_json = lambda *a, **k: {"response": "unknown callsign"}
         out = flightwall.get_routes(
-            [{"callsign": "AAA1", "lat": 38.0, "lng": -78.5}], focus="AAA1")
+            [{"callsign": "AAA1", "lat": 38.0, "lng": -78.5}], live="AAA1")
         self.assertEqual(out["errors"], [])
+        self.assertEqual(flightwall.aeroapi_usage()["queries"], 0)
 
 
 class TraceReconciliationTests(unittest.TestCase):

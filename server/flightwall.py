@@ -64,6 +64,15 @@ PROVIDERS = [
 AEROAPI_URL = "https://aeroapi.flightaware.com/aeroapi/flights/{ident}"
 AEROAPI_TTL = 60 * 60 * 6
 
+# GET /flights/{ident} is priced per result set. The free Personal allowance is
+# $5 a month, so a few hundred queries, and this board can burn that in an
+# afternoon: in cycle mode it changes aircraft every nine seconds, and roughly
+# 250 new callsigns an hour cross a 60nm circle. Unbounded querying would run
+# to hundreds of dollars a month, so the cap is not a nicety.
+AEROAPI_QUERY_COST = 0.005
+AEROAPI_MONTHLY_CAP = 800  # ~$4.00, comfortably inside the free allowance
+AEROAPI_USAGE_FILE = "aeroapi_usage.json"
+
 # The community route tables. All three are a flight number mapped to the
 # airports that number meant when the table was built, with no date attached,
 # so a reassigned number keeps its old airports indefinitely. Kept because
@@ -739,6 +748,44 @@ def check_routes(callsigns: list) -> int:
     return 0
 
 
+_usage_lock = threading.Lock()
+
+
+def aeroapi_usage() -> dict:
+    """Queries spent this calendar month, kept on disk.
+
+    A counter held only in memory would reset every time the agent restarted,
+    which on an always-on laptop is exactly when nobody is watching. The month
+    is part of the record so it rolls over on its own.
+    """
+    month = time.strftime("%Y-%m")
+    path = STATE / AEROAPI_USAGE_FILE
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        data = {}
+    if data.get("month") != month:
+        data = {"month": month, "queries": 0}
+    return data
+
+
+def _spend_aeroapi_query() -> bool:
+    """Claim one query against this month's cap. False means do not call."""
+    with _usage_lock:
+        data = aeroapi_usage()
+        if data["queries"] >= AEROAPI_MONTHLY_CAP:
+            return False
+        data["queries"] += 1
+        try:
+            STATE.mkdir(parents=True, exist_ok=True)
+            (STATE / AEROAPI_USAGE_FILE).write_text(json.dumps(data))
+        except OSError:
+            # Losing the count is not a reason to stop serving the board, but
+            # it does mean the cap stops protecting anything, so say so.
+            log("WARNING: could not record AeroAPI usage; the cap is not enforced")
+        return True
+
+
 def _codes_of(airport: dict) -> set:
     return {c for c in (airport.get("icao"), airport.get("iata")) if c}
 
@@ -790,16 +837,18 @@ def reconcile_with_trace(entry: dict, hex_id: str) -> dict | None:
     return None
 
 
-def get_routes(planes: list, focus: str | None = None) -> dict:
+def get_routes(planes: list, focus: str | None = None, live: str | None = None) -> dict:
     """Resolve callsigns to ORD-LAX style routes. ADS-B never carries the route,
     so this is a separate lookup, and it is very cacheable.
 
     Three sources, in descending order of how much they can be trusted:
 
       FlightAware   today's actual flight. Costs a query, so it is asked only
-                    about `focus` - the one aircraft the board is showing.
+                    about `live`, and `live` is only ever set because somebody
+                    asked for that aircraft. Cycling past one costs nothing.
       route tables  free, undated, and wrong most of the time; every answer
-                    has to survive the position check before it is shown.
+                    has to survive the position check, and the aircraft on the
+                    board is judged against its own departure on top of that.
       the aircraft  its own descent and its own track history. Never stale,
                     because it is an observation rather than a record.
 
@@ -812,28 +861,7 @@ def get_routes(planes: list, focus: str | None = None) -> dict:
     positions = {}
     unknown = []
     focus = (focus or "").strip().upper() or None
-
-    if focus:
-        cached = route_cache.get(f"aero:{focus}")
-        if cached is None:
-            try:
-                confirmed = _route_via_aeroapi(focus)
-            except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
-                detail = f"aeroapi: {type(exc).__name__}: {exc}"
-                errors.append(detail)
-                note_provider("routes:live", False, detail)
-                confirmed = None
-            else:
-                # Cache the miss too. A number FlightAware has no live flight
-                # for will not sprout one in the next few minutes, and each
-                # ask costs real money.
-                route_cache.set(f"aero:{focus}", confirmed or False, ttl=AEROAPI_TTL)
-                if confirmed:
-                    note_provider("routes:live", True, f"resolved {focus}")
-        else:
-            confirmed = cached or None
-        if confirmed:
-            out[focus] = confirmed
+    live = (live or "").strip().upper() or None
 
     for plane in planes:
         callsign = (plane.get("callsign") or "").strip().upper()
@@ -844,8 +872,6 @@ def get_routes(planes: list, focus: str | None = None) -> dict:
         if lon is None:
             lon = to_number(plane.get("lon"))
         positions[callsign] = (lat, lon)
-        if callsign in out:
-            continue  # FlightAware already answered; nothing can improve on it
 
         cached = route_cache.get(callsign)
         if cached is not None:
@@ -924,19 +950,63 @@ def get_routes(planes: list, focus: str | None = None) -> dict:
     # above only proves a route is not absurd; the aircraft's own departure
     # proves whether it is this flight, and which way round it is flying.
     # Not applied to the whole list because each check costs a trace fetch.
-    if focus and out.get(focus) and out[focus].get("source") != "aeroapi":
+    if focus:
         hex_id = next(
             ((p.get("hex") or "").strip().lower() for p in planes
              if (p.get("callsign") or "").strip().upper() == focus and p.get("hex")),
             None,
         )
-        if hex_id:
+        if hex_id and out.get(focus):
             settled = reconcile_with_trace(out[focus], hex_id)
             # A record the aircraft contradicts outright is worse than a blank
             # panel: the derived origin and destination will answer instead.
             out[focus] = settled if settled else None
 
+    # A paid query happens only when the board is told to make one, never
+    # because an aircraft happened to come round on the cycle. The client asks
+    # for exactly one on open, for whatever is nearest, and one more each time
+    # somebody taps an aircraft.
+    if live:
+        confirmed = _live_route(live, errors)
+        if confirmed:
+            out[live] = confirmed
+
     return {"routes": out, "derived": derive(planes, focus), "errors": errors}
+
+
+def _live_route(callsign: str, errors: list) -> dict | None:
+    """FlightAware's answer for one callsign, within the monthly cap.
+
+    Misses are cached alongside hits: a number FlightAware has no live flight
+    for will not sprout one in the next few minutes, and asking again costs
+    the same as asking the first time.
+    """
+    cached = route_cache.get(f"aero:{callsign}")
+    if cached is not None:
+        return cached or None
+
+    if not aeroapi_key():
+        return None
+
+    if not _spend_aeroapi_query():
+        note_provider("routes:live", False,
+                      f"monthly cap of {AEROAPI_MONTHLY_CAP} queries reached")
+        return None
+
+    try:
+        confirmed = _route_via_aeroapi(callsign)
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+        detail = f"aeroapi: {type(exc).__name__}: {exc}"
+        errors.append(detail)
+        note_provider("routes:live", False, detail)
+        return None
+
+    route_cache.set(f"aero:{callsign}", confirmed or False, ttl=AEROAPI_TTL)
+    spent = aeroapi_usage()["queries"]
+    note_provider("routes:live", True,
+                  f"{'resolved' if confirmed else 'no live flight for'} {callsign}"
+                  f" ({spent}/{AEROAPI_MONTHLY_CAP} this month)")
+    return confirmed
 
 
 def derive(planes: list, focus: str | None = None) -> dict:
@@ -1153,10 +1223,13 @@ class Handler(BaseHTTPRequestHandler):
             focus = payload.get("focus")
             if focus is not None and not isinstance(focus, str):
                 raise ValueError("focus must be a string")
+            live = payload.get("live")
+            if live is not None and not isinstance(live, str):
+                raise ValueError("live must be a string")
         except ValueError as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
-        self.send_json(get_routes(planes[:200], focus))
+        self.send_json(get_routes(planes[:200], focus, live))
 
 
 # ----------------------------------------------------------------- entrypoint

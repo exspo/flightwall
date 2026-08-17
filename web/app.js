@@ -74,6 +74,14 @@ const state = {
   lastRouteFetch: 0,
   routesInFlight: false,
   routeError: null,
+  // A live-flight lookup costs a query against a small monthly allowance, so
+  // it happens only when somebody asks for a particular aircraft: once on
+  // open for whatever is nearest, and once more per tap. Cycling past an
+  // aircraft is not asking. `liveAsked` stops a poll re-requesting one that
+  // has already been paid for.
+  liveWanted: null,
+  liveAsked: new Set(),
+  openedLive: false,
   fetching: false,
   error: null,
   source: null,
@@ -401,6 +409,14 @@ async function refresh(force = false) {
     fetchLandmarks();
     fetchRoutes();
     renderList();
+
+    // One live lookup per app open, for whatever is overhead. After this the
+    // board spends nothing until somebody taps an aircraft.
+    if (!state.openedLive && state.aircraft.length) {
+      state.openedLive = true;
+      const nearest = visibleAircraft().find((ac) => ac.flight);
+      if (nearest) requestLiveRoute(nearest);
+    }
   } catch (err) {
     state.error = err.message;
     showBanner(`Could not reach the aircraft feed: ${err.message}`, true);
@@ -433,6 +449,21 @@ function telemetryFor(ac) {
   };
 }
 
+/**
+ * Ask for the live, paid answer on one aircraft. Only ever called because a
+ * person wanted this particular flight - a tap, or the nearest aircraft when
+ * the app opens. Repeats are free: once a callsign has been asked for, the
+ * server has it cached and there is nothing to buy.
+ */
+function requestLiveRoute(ac) {
+  if (!ac || !ac.flight) return;
+  const callsign = ac.flight;
+  if (state.liveAsked.has(callsign)) return;
+  state.liveAsked.add(callsign);
+  state.liveWanted = callsign;
+  fetchRoutes(true);
+}
+
 async function fetchRoutes(force = false) {
   if (!force && Date.now() - state.lastRouteFetch < ROUTE_POLL_MS) return;
   const wanted = state.aircraft
@@ -448,15 +479,31 @@ async function fetchRoutes(force = false) {
     wanted.unshift(telemetryFor(focus));
   }
 
-  if (!wanted.length || state.routesInFlight) return;
+  const live = state.liveWanted;
+  if ((!wanted.length && !live) || state.routesInFlight) return;
   state.lastRouteFetch = Date.now();
   state.routesInFlight = true;
+  // Cleared before the request rather than after, so a slow reply cannot let
+  // the next poll bill the same aircraft twice.
+  state.liveWanted = null;
+
+  // A live lookup is keyed on the callsign, so its aircraft has to be in the
+  // payload even when its route is already cached.
+  if (live && !wanted.some((p) => p.callsign === live)) {
+    const ac = state.aircraft.find((a) => a.flight === live);
+    if (ac) wanted.unshift(telemetryFor(ac));
+  }
+
   try {
     const res = await fetch("api/routes", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin",
-      body: JSON.stringify({ planes: wanted, focus: focus ? focus.flight : null }),
+      body: JSON.stringify({
+        planes: wanted,
+        focus: focus ? focus.flight : null,
+        live,
+      }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const { routes, derived, errors } = await res.json();
@@ -1200,6 +1247,8 @@ function bindControls() {
     state.settings.focus = "pinned";
     saveSettings();
     syncControls();
+    // Picking an aircraft out of the list is the request for the real answer.
+    requestLiveRoute(state.aircraft.find((ac) => ac.hex === state.pinned));
     // The highlight follows from drawBoard on the next frame.
   });
 
@@ -1231,6 +1280,7 @@ function bindControls() {
       state.settings.focus = "pinned";
       saveSettings();
       syncControls();
+      requestLiveRoute(best);
     }
   });
 
