@@ -59,16 +59,18 @@ PROVIDERS = [
 
 # FlightAware, the only source here that knows what today's date is. Everything
 # else in this file answers from a table built at some point in the past.
-# Queries cost money beyond the free monthly allowance, so it is asked about
-# one aircraft at a time - whichever the board is actually showing.
 AEROAPI_URL = "https://aeroapi.flightaware.com/aeroapi/flights/{ident}"
 AEROAPI_TTL = 60 * 60 * 6
 
-# GET /flights/{ident} is priced per result set. The free Personal allowance is
-# $5 a month, so a few hundred queries, and this board can burn that in an
-# afternoon: in cycle mode it changes aircraft every nine seconds, and roughly
-# 250 new callsigns an hour cross a 60nm circle. Unbounded querying would run
-# to hundreds of dollars a month, so the cap is not a nicety.
+# It is also the only source that costs money, and this board is the wrong
+# shape for that. GET /flights/{ident} is $0.005 per result set against a $5
+# monthly allowance, while the board changes aircraft every nine seconds and
+# 296 new callsigns an hour cross a 60nm circle (measured over 5 minutes, 11
+# samples). Querying whatever happened to be on screen tied spending to the
+# sky rather than to anyone's interest in it, and ran to hundreds of dollars a
+# month. A query is now spent only when the client names an aircraft in
+# `live`, which it does once on open and once per tap. The cap below is the
+# backstop for that policy failing, not the policy itself.
 AEROAPI_QUERY_COST = 0.005
 AEROAPI_MONTHLY_CAP = 800  # ~$4.00, comfortably inside the free allowance
 AEROAPI_USAGE_FILE = "aeroapi_usage.json"
@@ -1118,6 +1120,7 @@ class Handler(BaseHTTPRequestHandler):
         path, query = parsed.path, urllib.parse.parse_qs(parsed.query)
 
         if path == "/api/health":
+            spent = aeroapi_usage()
             self.send_json({
                 "ok": True,
                 "version": "1.0",
@@ -1133,6 +1136,17 @@ class Handler(BaseHTTPRequestHandler):
                         else "config.json" if aeroapi_key()
                         else None
                     ),
+                    # What has actually been spent. Without this the owner has
+                    # to go and read FlightAware's own dashboard to answer
+                    # "is this thing costing me anything", which is the one
+                    # question the board should be able to answer itself.
+                    "spent": spent["queries"],
+                    "cap": AEROAPI_MONTHLY_CAP,
+                    "month": spent["month"],
+                    "estimatedCost": round(spent["queries"] * AEROAPI_QUERY_COST, 3),
+                    # Names the spending rule, so which build is running can be
+                    # read from outside rather than inferred.
+                    "policy": "on-request",
                 },
                 "airports": airports.loaded(),
                 "auth": bool(self.token),
