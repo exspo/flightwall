@@ -320,6 +320,16 @@ a.route-reg:active {
   font-weight: 600;
 }
 
+/* Where an answer came from. Deliberately quieter than the answer itself:
+   it is there to be checked, not read. */
+.route-source {
+  margin-top: 10px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  opacity: 0.75;
+}
+
 /* ------------------------------------------------------------------- scope */
 
 .scope {

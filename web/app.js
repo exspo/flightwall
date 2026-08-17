@@ -60,6 +60,11 @@ const state = {
   positionSource: null,
   aircraft: [],
   routes: new Map(),
+  // What each aircraft says about itself, keyed by hex: the phase of flight,
+  // the airport it is descending towards, and where it took off. Separate
+  // from `routes` because it is an observation rather than a record, so it is
+  // refreshed every poll instead of cached for the day.
+  derived: new Map(),
   airlines: {},
   pinned: null,
   focusHex: null,
@@ -205,11 +210,6 @@ function titleOf(ac) {
 function usableRoute(ac) {
   const route = state.routes.get(ac.flight);
   return route && !route.suspect ? route : null;
-}
-
-function suspectRoute(ac) {
-  const route = state.routes.get(ac.flight);
-  return route && route.suspect ? route : null;
 }
 
 function colorOf(ac) {
@@ -414,12 +414,40 @@ async function refresh(force = false) {
  *        aircraft whose route is not known yet, so selecting something does
  *        not sit on "Looking up…" for most of a poll cycle.
  */
+/** Everything the server needs to work out where an aircraft is going without
+ *  asking a route table: where it is, which way it is pointing, how fast, and
+ *  whether it is on its way down. */
+function telemetryFor(ac) {
+  return {
+    callsign: ac.flight || "",
+    hex: ac.hex,
+    lat: ac.lat,
+    lng: ac.lon,
+    // The server speaks the readsb dialect on the way in; the board renames
+    // these on the way out, so they are translated back here.
+    track: ac.trk,
+    gs: ac.gs,
+    alt_baro: ac.gnd ? "ground" : ac.alt,
+    baro_rate: ac.vs,
+    nav_altitude_mcp: ac.sel,
+  };
+}
+
 async function fetchRoutes(force = false) {
   if (!force && Date.now() - state.lastRouteFetch < ROUTE_POLL_MS) return;
   const wanted = state.aircraft
     .filter((ac) => airlineOf(ac) && !state.routes.has(ac.flight))
     .slice(0, 100)
-    .map((ac) => ({ callsign: ac.flight, lat: ac.lat, lng: ac.lon }));
+    .map(telemetryFor);
+
+  // The focused aircraft rides along on every poll even when its route is
+  // already cached: it is the one on screen, its descent changes minute by
+  // minute, and it is the only aircraft worth spending an origin lookup on.
+  const focus = focusedAircraft();
+  if (focus && !wanted.some((p) => p.hex === focus.hex)) {
+    wanted.unshift(telemetryFor(focus));
+  }
+
   if (!wanted.length || state.routesInFlight) return;
   state.lastRouteFetch = Date.now();
   state.routesInFlight = true;
@@ -428,12 +456,22 @@ async function fetchRoutes(force = false) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin",
-      body: JSON.stringify({ planes: wanted }),
+      body: JSON.stringify({ planes: wanted, focus: focus ? focus.flight : null }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const { routes, errors } = await res.json();
+    const { routes, derived, errors } = await res.json();
     for (const [callsign, route] of Object.entries(routes || {})) {
       state.routes.set(callsign, route);
+    }
+    for (const [hex, info] of Object.entries(derived || {})) {
+      // Keep the last known origin: it is fetched only for the focused
+      // aircraft, and dropping it when focus moves on would make the panel
+      // flicker on the way back.
+      const previous = state.derived.get(hex);
+      state.derived.set(hex, {
+        ...info,
+        origin: info.origin || (previous && previous.origin) || null,
+      });
     }
     // An upstream failure returns no entry for the callsign, so without this
     // the UI would claim it is still looking, forever.
@@ -1032,29 +1070,90 @@ function renderRoute() {
       (via.length
         ? `<p class="route-none">via ${via.map((a) => escapeHtml(a.iata || a.icao || "")).join(", ")}</p>`
         : "") +
-      routeLeg("To", to);
+      routeLeg("To", to) +
+      sourceNote(route);
     return;
   }
 
-  // Distinguish "we have not looked yet" from "there is nothing to find" -
-  // a private flight has no route to report and never will.
-  const airline = airlineOf(ac);
-  const suspect = suspectRoute(ac);
-  const message = !airline
-    ? "Flying under a tail number rather than an airline callsign, so there is no filed route to look up."
-    : suspect
-    // Short, because on a bad day this appears on every aircraft. The rejected
-    // route is still named, since it is usually recognisable as an old
-    // schedule and makes the judgement checkable.
-    ? `No reliable route — every source says <b>${escapeHtml(
-        (suspect.route || "unknown").toUpperCase()
-      )}</b>, which this aircraft is nowhere near. Tap the flight number for the live picture.`
-    : state.routes.has(ac.flight)
-    ? `No route on file for <b>${escapeHtml(ac.flight)}</b>.`
-    : state.routeError
-    ? `Route lookup is unavailable — ${escapeHtml(state.routeError)}. Aircraft data is unaffected.`
-    : `Looking up the route for <b>${escapeHtml(ac.flight)}</b>…`;
-  container.innerHTML = header + `<p class="route-none">${message}</p>`;
+  // No route table would answer for this aircraft, so fall back to what it is
+  // broadcasting about itself. It flew out of somewhere real a few hours ago
+  // and, if it is on its way down, it is pointing at somewhere real now.
+  const info = state.derived.get(ac.hex) || {};
+  if (info.origin || info.destination) {
+    // Light aircraft fly circuits, and a training flight that took off and is
+    // landing back at the same field is a round trip rather than a broken
+    // lookup. Saying it once reads as an answer; saying it twice reads as a
+    // bug.
+    const sameField =
+      info.origin && info.destination &&
+      (info.origin.icao || info.origin.iata) === (info.destination.icao || info.destination.iata);
+
+    container.innerHTML =
+      header +
+      (sameField
+        ? routeLeg("Local", info.origin)
+        : (info.origin
+            ? routeLeg("From", info.origin)
+            : `<p class="route-none">Departure airport not identified.</p>`) +
+          `<div class="route-rule"></div>` +
+          (info.destination
+            ? routeLeg("To", info.destination)
+            : `<p class="route-none">${escapeHtml(phaseSentence(ac, info))}</p>`)) +
+      observedNote(info, sameField);
+    return;
+  }
+
+  container.innerHTML =
+    header + `<p class="route-none">${escapeHtml(phaseSentence(ac, info))}</p>` + lookupNote();
+}
+
+/** A broken route backend should still be findable, but it is a note at the
+ *  bottom rather than the headline: the panel above it is already answering
+ *  the question from the aircraft's own telemetry. */
+function lookupNote() {
+  if (!state.routeError) return "";
+  return `<p class="route-source">Route lookup unavailable — ${escapeHtml(state.routeError)}</p>`;
+}
+
+/** Where a resolved route came from. Only worth saying when it is the live
+ *  one, since that is the difference between today's flight and a table. */
+function sourceNote(route) {
+  if (route.source !== "aeroapi") return "";
+  const progress = Number.isFinite(route.progress) ? ` · ${Math.round(route.progress)}% flown` : "";
+  return `<p class="route-source">Live flight status${escapeHtml(progress)}</p>`;
+}
+
+function observedNote(info, sameField = false) {
+  if (sameField) {
+    return `<p class="route-source">Read from the aircraft: took off here and is descending back to it</p>`;
+  }
+  const parts = [];
+  if (info.origin) parts.push("departure from its track history");
+  if (info.destination) {
+    parts.push(info.destination.confidence === "high" ? "arrival from its descent" : "likely arrival from its descent");
+  }
+  return parts.length ? `<p class="route-source">Read from the aircraft: ${parts.join(", ")}</p>` : "";
+}
+
+/**
+ * What the aircraft is doing, said plainly. This is the last thing the panel
+ * has to offer, and it is still a real answer: altitude, trend, and bearing
+ * are all being broadcast continuously, so there is no reason to show the
+ * reader an apology instead.
+ */
+function phaseSentence(ac, info) {
+  const where = `${fmtDist(ac.dst)} ${compassPoint(ac.dir)}`;
+  if (ac.gnd) return `On the ground, ${where}.`;
+
+  const alt = Number.isFinite(ac.alt) ? `${Math.round(ac.alt).toLocaleString()} ft` : null;
+  const phase = (info && info.phase) || null;
+  const verb =
+    phase === "descent" ? "Descending through" :
+    phase === "climb" ? "Climbing through" :
+    "Level at";
+
+  if (!alt) return `Overhead, ${where}.`;
+  return `${verb} ${alt}, ${where}.`;
 }
 
 /** Move the highlight without rebuilding the list markup - this runs whenever

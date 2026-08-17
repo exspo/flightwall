@@ -162,38 +162,47 @@ class RouteTests(unittest.TestCase):
     def tearDown(self):
         flightwall.fetch_json = self._real
 
+    @staticmethod
+    def _adsbdb(callsign="DAL926", origin=("ATL", "KATL", "Atlanta", 33.6367, -84.4281),
+                dest=("MSP", "KMSP", "Minneapolis", 44.8820, -93.2218)):
+        def node(spec):
+            iata, icao, city, lat, lon = spec
+            return {
+                "iata_code": iata, "icao_code": icao, "name": f"{city} International",
+                "municipality": city, "country_iso_name": "US",
+                "latitude": lat, "longitude": lon,
+            }
+        return {"response": {"flightroute": {
+            "callsign": callsign, "callsign_iata": callsign,
+            "airline": {"icao": callsign[:3]},
+            "origin": node(origin), "destination": node(dest),
+        }}}
+
     def test_plausible_route_is_returned_and_cached(self):
         calls = []
 
         def fake(url, payload=None, timeout=8.0):
-            calls.append(payload)
-            return [{
-                "callsign": "UAL2402", "airline_code": "UAL", "number": "2402",
-                "_airport_codes_iata": "ORD-LAX", "plausible": 1,
-                "_airports": [
-                    {"iata": "ORD", "icao": "KORD", "location": "Chicago"},
-                    {"iata": "LAX", "icao": "KLAX", "location": "Los Angeles"},
-                ],
-            }]
+            calls.append(url)
+            return self._adsbdb("DAL926")
 
         flightwall.fetch_json = fake
-        out = flightwall.get_routes([{"callsign": "UAL2402", "lat": 41.9, "lng": -87.9}])
-        self.assertEqual(out["routes"]["UAL2402"]["route"], "ORD-LAX")
+        # Somewhere between Atlanta and Minneapolis.
+        out = flightwall.get_routes([{"callsign": "DAL926", "lat": 39.0, "lng": -88.8}])
+        self.assertEqual(out["routes"]["DAL926"]["route"], "ATL-MSP")
         self.assertEqual(out["errors"], [])
 
-        flightwall.get_routes([{"callsign": "UAL2402", "lat": 41.9, "lng": -87.9}])
+        flightwall.get_routes([{"callsign": "DAL926", "lat": 39.0, "lng": -88.8}])
         self.assertEqual(len(calls), 1, "second lookup should hit the cache")
 
-    def test_implausible_route_is_discarded(self):
-        # A wrong route on the board is worse than a blank one.
-        flightwall.fetch_json = lambda *a, **k: [
-            {"callsign": "XYZ1", "_airport_codes_iata": "AAA-BBB", "plausible": 0}
-        ]
-        out = flightwall.get_routes([{"callsign": "XYZ1", "lat": 0, "lng": 0}])
-        self.assertIsNone(out["routes"]["XYZ1"])
+    def test_route_contradicted_by_position_is_flagged_suspect(self):
+        # The failure that made the badge useless: a table answers confidently
+        # with a route the aircraft is thousands of miles from.
+        flightwall.fetch_json = lambda *a, **k: self._adsbdb("SWA1195")
+        out = flightwall.get_routes([{"callsign": "SWA1195", "lat": 38.0, "lng": -78.5}])
+        self.assertTrue(out["routes"]["SWA1195"]["suspect"])
 
     def test_unanswered_callsign_is_negative_cached(self):
-        flightwall.fetch_json = lambda *a, **k: []
+        flightwall.fetch_json = lambda *a, **k: {"response": "unknown callsign"}
         out = flightwall.get_routes([{"callsign": "NOPE1", "lat": 0, "lng": 0}])
         self.assertIsNone(out["routes"]["NOPE1"])
         self.assertIn("NOPE1", flightwall.route_cache._data)
@@ -212,47 +221,34 @@ class RouteTests(unittest.TestCase):
         self.assertNotIn("DAL926", flightwall.route_cache._data,
                          "a failed lookup must not be cached as a known miss")
 
-    def test_falls_back_to_adsbdb_when_the_batch_endpoint_misbehaves(self):
-        # The reported failure: adsb.lol answered 200 with a non-JSON body.
+    def test_falls_back_to_the_standing_data_when_adsbdb_misbehaves(self):
         calls = []
 
         def fake(url, payload=None, timeout=8.0):
             calls.append(url)
-            if "adsb.lol" in url:
+            if "adsbdb" in url:
                 raise ValueError("HTTP 200 returned non-JSON: <empty body>")
             return {
-                "response": {
-                    "flightroute": {
-                        "callsign": "DAL926",
-                        "callsign_iata": "DL926",
-                        "airline": {"icao": "DAL"},
-                        "origin": {
-                            "iata_code": "ATL", "icao_code": "KATL",
-                            "name": "Hartsfield Jackson Atlanta International",
-                            "municipality": "Atlanta", "country_iso_name": "US",
-                        },
-                        "destination": {
-                            "iata_code": "MSP", "icao_code": "KMSP",
-                            "name": "Minneapolis St Paul International",
-                            "municipality": "Minneapolis", "country_iso_name": "US",
-                        },
-                    }
-                }
+                "callsign": "DAL926", "airline_code": "DAL", "number": "926",
+                "_airport_codes_iata": "ATL-MSP",
+                "_airports": [
+                    {"iata": "ATL", "icao": "KATL", "location": "Atlanta",
+                     "lat": 33.6367, "lon": -84.4281},
+                    {"iata": "MSP", "icao": "KMSP", "location": "Minneapolis",
+                     "lat": 44.8820, "lon": -93.2218},
+                ],
             }
 
         flightwall.fetch_json = fake
-        out = flightwall.get_routes([{"callsign": "DAL926", "lat": 41.9, "lng": -87.9}])
+        out = flightwall.get_routes([{"callsign": "DAL926", "lat": 39.0, "lng": -88.8}])
         entry = out["routes"]["DAL926"]
         self.assertEqual(entry["route"], "ATL-MSP")
-        self.assertEqual(entry["airports"][0]["location"], "Atlanta")
         self.assertEqual(entry["airports"][-1]["iata"], "MSP")
         self.assertTrue(out["errors"], "the first provider's failure should still be reported")
-        self.assertTrue(any("adsbdb" in c for c in calls))
+        self.assertTrue(any("vrs-standing-data" in c for c in calls))
 
     def test_adsbdb_404_is_a_definitive_miss(self):
         def fake(url, payload=None, timeout=8.0):
-            if "adsb.lol" in url:
-                raise OSError("down")
             raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
 
         flightwall.fetch_json = fake
@@ -269,10 +265,147 @@ class RouteTests(unittest.TestCase):
         flightwall.get_routes([{"callsign": "DAL926", "lat": 0, "lng": 0}])
         self.assertNotIn("DAL926", flightwall.route_cache._data)
 
-    def test_non_list_response_is_reported(self):
-        flightwall.fetch_json = lambda *a, **k: {"error": "rate limited"}
-        out = flightwall.get_routes([{"callsign": "DAL926", "lat": 0, "lng": 0}])
-        self.assertTrue(out["errors"])
+
+class AeroApiTests(unittest.TestCase):
+    """FlightAware is the only source that knows the date, so when it answers
+    it wins outright and is never second-guessed by the position check."""
+
+    def setUp(self):
+        flightwall.route_cache._data.clear()
+        self._key = flightwall.aeroapi_key
+        self._fetch = flightwall.fetch_json
+        self._open = flightwall.urllib.request.urlopen
+        flightwall.aeroapi_key = lambda: "test-key"
+
+    def tearDown(self):
+        flightwall.aeroapi_key = self._key
+        flightwall.fetch_json = self._fetch
+        flightwall.urllib.request.urlopen = self._open
+
+    def _serve(self, payload):
+        class Resp:
+            def read(self):
+                return json.dumps(payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        flightwall.urllib.request.urlopen = lambda *a, **k: Resp()
+
+    def test_airborne_flight_wins_over_the_static_tables(self):
+        self._serve({"flights": [
+            {"ident": "ENY3390", "actual_off": "2026-08-17T12:00:00Z", "actual_on": None,
+             "operator_icao": "ENY", "flight_number": "3390", "progress_percent": 80,
+             "status": "En Route", "origin": {"code_icao": "KCLT", "code_iata": "CLT"},
+             "destination": {"code_icao": "KCHO", "code_iata": "CHO"}},
+        ]})
+        # The tables would say something else entirely; they must not be asked.
+        flightwall.fetch_json = lambda *a, **k: self.fail("tables queried despite a live answer")
+        out = flightwall.get_routes(
+            [{"callsign": "ENY3390", "lat": 38.0, "lng": -78.5}], focus="ENY3390")
+        entry = out["routes"]["ENY3390"]
+        self.assertEqual(entry["route"], "CLT-CHO")
+        self.assertEqual(entry["source"], "aeroapi")
+        self.assertEqual(entry["confidence"], "confirmed")
+        self.assertNotIn("suspect", entry)
+
+    def test_coordinates_are_filled_from_the_local_airport_table(self):
+        self._serve({"flights": [
+            {"actual_off": "2026-08-17T12:00:00Z", "actual_on": None,
+             "origin": {"code_icao": "KATL"}, "destination": {"code_icao": "KMSP"}},
+        ]})
+        entry = flightwall._route_via_aeroapi("DAL926")
+        self.assertAlmostEqual(entry["airports"][0]["lat"], 33.6367, places=1)
+        self.assertEqual(entry["airports"][-1]["iata"], "MSP")
+
+    def test_a_landed_flight_is_not_offered_as_current(self):
+        self._serve({"flights": [
+            {"actual_off": "2026-08-17T09:00:00Z", "actual_on": "2026-08-17T11:00:00Z",
+             "origin": {"code_icao": "KATL"}, "destination": {"code_icao": "KMSP"}},
+        ]})
+        self.assertIsNone(flightwall._route_via_aeroapi("DAL926"))
+
+    def test_only_the_focused_aircraft_costs_a_query(self):
+        asked = []
+        real_lookup = flightwall._route_via_aeroapi
+        real_trace = flightwall.airports.origin_from_trace
+
+        def spy(ident):
+            asked.append(ident)
+            return None
+
+        flightwall._route_via_aeroapi = spy
+        flightwall.airports.origin_from_trace = lambda h: None  # keep the suite offline
+        flightwall.fetch_json = lambda *a, **k: {"response": "unknown callsign"}
+        try:
+            flightwall.get_routes([
+                {"callsign": "AAA1", "lat": 38.0, "lng": -78.5, "hex": "a00001"},
+                {"callsign": "BBB2", "lat": 38.1, "lng": -78.6, "hex": "a00002"},
+            ], focus="AAA1")
+        finally:
+            flightwall._route_via_aeroapi = real_lookup
+            flightwall.airports.origin_from_trace = real_trace
+        self.assertEqual(asked, ["AAA1"])
+
+    def test_no_key_is_a_normal_state_not_an_error(self):
+        flightwall.aeroapi_key = lambda: None
+        flightwall.fetch_json = lambda *a, **k: {"response": "unknown callsign"}
+        out = flightwall.get_routes(
+            [{"callsign": "AAA1", "lat": 38.0, "lng": -78.5}], focus="AAA1")
+        self.assertEqual(out["errors"], [])
+
+
+class DerivedTests(unittest.TestCase):
+    """What the aircraft says about itself. No route table involved, so
+    nothing here can go stale."""
+
+    def test_descending_aircraft_gets_a_destination(self):
+        # 2,000 ft over Dulles, descending, pointing at it.
+        out = flightwall.derive([{
+            "hex": "abc123", "callsign": "UAL1181", "lat": 38.85, "lng": -77.30,
+            "track": 300, "gs": 200, "alt_baro": 2000, "baro_rate": -900,
+        }])
+        dest = out["abc123"]["destination"]
+        self.assertEqual(dest["iata"], "IAD")
+        self.assertEqual(dest["confidence"], "high")
+        self.assertEqual(out["abc123"]["phase"], "descent")
+
+    def test_cruising_aircraft_gets_no_destination(self):
+        # At altitude an aeroplane looks the same whether it is stopping at
+        # the next field or carrying on for another two thousand miles.
+        out = flightwall.derive([{
+            "hex": "abc124", "lat": 38.0, "lng": -78.5, "track": 90,
+            "gs": 450, "alt_baro": 37000, "baro_rate": 0,
+        }])
+        self.assertIsNone(out["abc124"]["destination"])
+        self.assertEqual(out["abc124"]["phase"], "cruise")
+
+    def test_a_level_step_at_altitude_is_not_an_arrival(self):
+        # Selected altitude below the current one means a descent down low,
+        # but in the flight levels it is routine cruise housekeeping.
+        out = flightwall.derive([{
+            "hex": "abc125", "lat": 38.0, "lng": -78.5, "track": 90, "gs": 450,
+            "alt_baro": 37000, "baro_rate": 0, "nav_altitude_mcp": 33000,
+        }])
+        self.assertEqual(out["abc125"]["phase"], "cruise")
+        self.assertIsNone(out["abc125"]["destination"])
+
+    def test_origin_lookup_is_reserved_for_the_focused_aircraft(self):
+        # Each origin costs a few hundred KB of track history over the wire.
+        calls = []
+        real = flightwall.airports.origin_from_trace
+        flightwall.airports.origin_from_trace = lambda h: calls.append(h)
+        try:
+            flightwall.derive([
+                {"hex": "aaa001", "callsign": "AAA1", "lat": 38.0, "lng": -78.5},
+                {"hex": "bbb002", "callsign": "BBB2", "lat": 38.1, "lng": -78.6},
+            ], focus="AAA1")
+        finally:
+            flightwall.airports.origin_from_trace = real
+        self.assertEqual(calls, ["aaa001"])
 
 
 class EmptyFeedTests(unittest.TestCase):
@@ -435,13 +568,17 @@ class RoutePlausibilityTests(unittest.TestCase):
         flightwall.route_cache._data.clear()
         try:
             flightwall.fetch_json = lambda url, payload=None, timeout=8.0: (
-                [{
-                    "callsign": "DAL970", "_airport_codes_iata": "MSP-PDX", "plausible": 1,
+                {"response": {"flightroute": {
+                    "callsign": "DAL970", "airline": {"icao": "DAL"},
+                    "origin": {"iata_code": "MSP", "latitude": 44.8820, "longitude": -93.2218},
+                    "destination": {"iata_code": "PDX", "latitude": 45.5887, "longitude": -122.5975},
+                }}} if "adsbdb" in url else {
+                    "callsign": "DAL970", "_airport_codes_iata": "MSP-PDX",
                     "_airports": [
                         {"iata": "MSP", "lat": 44.8820, "lon": -93.2218},
                         {"iata": "PDX", "lat": 45.5887, "lon": -122.5975},
                     ],
-                }] if "adsb.lol" in url else {"response": "unknown callsign"}
+                }
             )
             out = flightwall.get_routes([{"callsign": "DAL970", "lat": 38.03, "lng": -78.48}])
         finally:
@@ -468,14 +605,14 @@ class RoutePlausibilityTests(unittest.TestCase):
         real = flightwall.fetch_json
         flightwall.route_cache._data.clear()
         try:
-            flightwall.fetch_json = lambda *a, **k: [{
-                "callsign": "PDT6055", "airline_code": "PDT", "number": "6055",
-                "_airport_codes_iata": "PHL-ALB", "plausible": 1,
-                "_airports": [
-                    {"iata": "PHL", "lat": 39.8719, "lon": -75.2411, "location": "Philadelphia"},
-                    {"iata": "ALB", "lat": 42.7483, "lon": -73.8017, "location": "Albany"},
-                ],
-            }]
+            flightwall.fetch_json = lambda *a, **k: {"response": {"flightroute": {
+                "callsign": "PDT6055", "callsign_iata": "PDT6055",
+                "airline": {"icao": "PDT"},
+                "origin": {"iata_code": "PHL", "municipality": "Philadelphia",
+                           "latitude": 39.8719, "longitude": -75.2411},
+                "destination": {"iata_code": "ALB", "municipality": "Albany",
+                                "latitude": 42.7483, "longitude": -73.8017},
+            }}}
             out = flightwall.get_routes(
                 [{"callsign": "PDT6055", "lat": 38.0386, "lng": -78.4529}]
             )

@@ -30,6 +30,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import airports
 import landmarks
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -55,11 +56,25 @@ PROVIDERS = [
     },
 ]
 
-ROUTE_URL = "https://api.adsb.lol/api/0/routeset"
-# Fallback, one callsign per request rather than a batch, so it is only worth
-# reaching for when the batch endpoint is unhealthy.
+# FlightAware, the only source here that knows what today's date is. Everything
+# else in this file answers from a table built at some point in the past.
+# Queries cost money beyond the free monthly allowance, so it is asked about
+# one aircraft at a time - whichever the board is actually showing.
+AEROAPI_URL = "https://aeroapi.flightaware.com/aeroapi/flights/{ident}"
+AEROAPI_TTL = 60 * 60 * 6
+
+# The community route tables. All three are a flight number mapped to the
+# airports that number meant when the table was built, with no date attached,
+# so a reassigned number keeps its old airports indefinitely. Kept because
+# they cost nothing and are occasionally right, never trusted on their own.
+#
+# adsb.lol's own batch endpoint (api/0/routeset) now answers HTTP 201 with an
+# empty body for every callsign, and its route path redirects here marked
+# deprecated, so the underlying file is fetched directly instead.
+VRS_URL = "https://vrs-standing-data.adsb.lol/routes/{prefix}/{callsign}.json"
 ADSBDB_URL = "https://api.adsbdb.com/v0/callsign/{callsign}"
 ADSBDB_MAX_LOOKUPS = 20
+VRS_MAX_LOOKUPS = 40
 
 AIRCRAFT_TTL = 4.0  # seconds; upstreams update about this often
 ROUTE_TTL = 60 * 60 * 24  # one day: any longer just preserves stale records
@@ -308,6 +323,10 @@ def normalize(ac: dict, lat: float, lon: float) -> dict | None:
         "gs": to_number(ac.get("gs")),
         "trk": to_number(ac.get("track")) if ac.get("track") is not None else to_number(ac.get("true_heading")),
         "vs": vs,
+        # Autopilot selected altitude. Unlike vertical speed it does not
+        # flicker, so it is what tells an aircraft levelled off mid-descent
+        # apart from one that is genuinely cruising.
+        "sel": to_number(ac.get("nav_altitude_mcp")),
         "squawk": squawk,
         "emergency": emergency,
         "mil": bool(int(ac.get("dbFlags") or 0) & 1),
@@ -394,26 +413,38 @@ def _route_entry(codes: str, airline, number, airports: list) -> dict:
     }
 
 
-def _routes_via_adsblol(batch: list) -> dict:
-    """Batch lookup. Returns only the callsigns the upstream answered for."""
-    rows = fetch_json(ROUTE_URL, payload={"planes": batch}, timeout=10.0)
-    if not isinstance(rows, list):
-        raise ValueError(f"expected a list, got {type(rows).__name__}")
+def _routes_via_vrs(batch: list) -> dict:
+    """VRS standing data, one file per callsign, straight off the CDN.
 
+    This is the table adsb.lol serves; its own batch endpoint returns an empty
+    body now, so the files are read directly. Static, undated, and wrong often
+    enough that every answer still has to clear the position check.
+    """
     found = {}
-    for row in rows:
+    for plane in batch[:VRS_MAX_LOOKUPS]:
+        callsign = plane["callsign"]
+        prefix = callsign[:2].upper()
+        if not prefix.isalnum():
+            continue
+        try:
+            row = fetch_json(
+                VRS_URL.format(prefix=urllib.parse.quote(prefix),
+                               callsign=urllib.parse.quote(callsign)),
+                timeout=8.0,
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code in (403, 404):
+                found[callsign] = None  # definitively not in the table
+                continue
+            raise
+
         if not isinstance(row, dict):
             continue
-        callsign = (row.get("callsign") or "").strip().upper()
-        if not callsign:
-            continue
         codes = row.get("_airport_codes_iata") or ""
-        # `plausible` 0 means the upstream matched a number but does not trust
-        # it. Showing a wrong route is worse than showing none.
-        if not row.get("plausible") or codes in ("unknown", ""):
+        if codes in ("unknown", ""):
             found[callsign] = None
             continue
-        airports = [
+        stops = [
             {
                 "iata": a.get("iata"),
                 "icao": a.get("icao"),
@@ -425,8 +456,138 @@ def _routes_via_adsblol(batch: list) -> dict:
             }
             for a in (row.get("_airports") or [])
         ]
-        found[callsign] = _route_entry(codes, row.get("airline_code"), row.get("number"), airports)
+        if len(stops) < 2:
+            found[callsign] = None
+            continue
+        found[callsign] = _route_entry(codes, row.get("airline_code"), row.get("number"), stops)
     return found
+
+
+# ------------------------------------------------------------------- aeroapi
+
+def aeroapi_key() -> str | None:
+    """The FlightAware key, if the owner has set one up.
+
+    Absent is a normal state, not an error: without it the board falls back to
+    what the aircraft itself broadcasts, which costs nothing and needs no
+    account.
+    """
+    key = os.environ.get("FLIGHTWALL_AEROAPI_KEY")
+    if key:
+        return key.strip()
+    try:
+        config = json.loads((STATE / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    key = config.get("aeroapi_key")
+    return key.strip() if isinstance(key, str) and key.strip() else None
+
+
+def _aeroapi_airport(node: dict) -> dict | None:
+    if not isinstance(node, dict):
+        return None
+    icao = node.get("code_icao") or None
+    iata = node.get("code_iata") or None
+    code = node.get("code") or None
+    if not (icao or iata or code):
+        return None
+    # FlightAware does not return coordinates on this endpoint, so they come
+    # from the local airport table. Without them the position check has
+    # nothing to measure, which is fine: this source does not need checking.
+    fix = None
+    for candidate in (icao, code, iata):
+        if candidate:
+            fix = _airport_by_code(candidate)
+            if fix:
+                break
+    return {
+        "iata": iata or (fix or {}).get("iata"),
+        "icao": icao or (fix or {}).get("icao"),
+        "name": node.get("name") or (fix or {}).get("name"),
+        "location": node.get("city") or (fix or {}).get("location"),
+        "lat": (fix or {}).get("lat"),
+        "lon": (fix or {}).get("lon"),
+    }
+
+
+_code_index: dict | None = None
+
+
+def _airport_by_code(code: str) -> dict | None:
+    """Look a code up in the bundled airport table, by ICAO then IATA."""
+    global _code_index
+    if _code_index is None:
+        index = {}
+        for row in airports._load():  # noqa: SLF001 - same project, one dataset
+            if row[airports.I_ICAO]:
+                index.setdefault(row[airports.I_ICAO], row)
+            if row[airports.I_IATA]:
+                index.setdefault(row[airports.I_IATA], row)
+        _code_index = index
+    row = _code_index.get((code or "").strip().upper())
+    return airports.as_dict(row) if row else None
+
+
+def _pick_current_flight(flights: list) -> dict | None:
+    """Which of the ~14 days of flights under this number is the one overhead.
+
+    Airborne beats everything: actual wheels-up with no wheels-down yet. After
+    that, the one that has most recently departed. A flight number that has
+    not flown today is not an answer at all - that is precisely the failure
+    the static tables make.
+    """
+    airborne = [
+        f for f in flights
+        if isinstance(f, dict) and f.get("actual_off") and not f.get("actual_on")
+    ]
+    if airborne:
+        return max(airborne, key=lambda f: f.get("actual_off") or "")
+    recent = [f for f in flights if isinstance(f, dict) and f.get("actual_off")]
+    if not recent:
+        return None
+    newest = max(recent, key=lambda f: f.get("actual_off") or "")
+    # Landed already; only worth reporting while it is still the same day's
+    # movement, otherwise it is just another stale record with a nicer source.
+    return newest if not newest.get("actual_on") else None
+
+
+def _route_via_aeroapi(callsign: str) -> dict | None:
+    """Today's actual route for one callsign, from FlightAware.
+
+    The one lookup in this file that is date-aware, and the only one whose
+    answer does not need checking against the aircraft's position.
+    """
+    key = aeroapi_key()
+    if not key:
+        return None
+
+    url = AEROAPI_URL.format(ident=urllib.parse.quote(callsign)) + "?ident_type=designator"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json; charset=UTF-8",
+        "x-apikey": key,
+    })
+    with urllib.request.urlopen(req, timeout=12.0) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+
+    flight = _pick_current_flight(data.get("flights") or [])
+    if not flight:
+        return None
+
+    origin = _aeroapi_airport(flight.get("origin"))
+    destination = _aeroapi_airport(flight.get("destination"))
+    if not origin or not destination:
+        return None
+
+    stops = [origin, destination]
+    codes = "-".join(a["iata"] or a["icao"] or "?" for a in stops)
+    entry = _route_entry(codes, flight.get("operator_icao") or flight.get("operator"),
+                         flight.get("flight_number"), stops)
+    entry["source"] = "aeroapi"
+    entry["confidence"] = "confirmed"
+    entry["progress"] = flight.get("progress_percent")
+    entry["status"] = flight.get("status")
+    return entry
 
 
 def _adsbdb_airport(node: dict) -> dict:
@@ -482,8 +643,8 @@ def _routes_via_adsbdb(batch: list) -> dict:
 
 
 ROUTE_PROVIDERS = [
-    ("adsb.lol", _routes_via_adsblol),
     ("adsbdb.com", _routes_via_adsbdb),
+    ("vrs-standing-data", _routes_via_vrs),
 ]
 
 # How far off the claimed path an aircraft may be before the route is treated
@@ -537,8 +698,10 @@ def route_is_plausible(entry: dict, lat, lon) -> bool:
 
 
 ROUTE_CANDIDATES = {
-    "adsb.lol": lambda cs: (ROUTE_URL, {"planes": [{"callsign": cs, "lat": 0, "lng": 0}]}),
     "adsbdb.com": lambda cs: (ADSBDB_URL.format(callsign=urllib.parse.quote(cs)), None),
+    "vrs-standing": lambda cs: (
+        VRS_URL.format(prefix=urllib.parse.quote(cs[:2].upper()),
+                       callsign=urllib.parse.quote(cs)), None),
     "hexdb.io": lambda cs: (f"https://hexdb.io/api/v1/route/icao/{urllib.parse.quote(cs)}", None),
 }
 
@@ -569,18 +732,50 @@ def check_routes(callsigns: list) -> int:
     return 0
 
 
-def get_routes(planes: list) -> dict:
+def get_routes(planes: list, focus: str | None = None) -> dict:
     """Resolve callsigns to ORD-LAX style routes. ADS-B never carries the route,
     so this is a separate lookup, and it is very cacheable.
 
-    Returns both the resolved routes and any upstream errors: a caller that
-    cannot tell "not looked up yet" from "the lookup failed" has no way to stop
-    showing a spinner forever.
+    Three sources, in descending order of how much they can be trusted:
+
+      FlightAware   today's actual flight. Costs a query, so it is asked only
+                    about `focus` - the one aircraft the board is showing.
+      route tables  free, undated, and wrong most of the time; every answer
+                    has to survive the position check before it is shown.
+      the aircraft  its own descent and its own track history. Never stale,
+                    because it is an observation rather than a record.
+
+    Returns the resolved routes, the derived origin and destination keyed by
+    hex, and any upstream errors: a caller that cannot tell "not looked up
+    yet" from "the lookup failed" has no way to stop showing a spinner.
     """
     errors = []
     out = {}
     positions = {}
     unknown = []
+    focus = (focus or "").strip().upper() or None
+
+    if focus:
+        cached = route_cache.get(f"aero:{focus}")
+        if cached is None:
+            try:
+                confirmed = _route_via_aeroapi(focus)
+            except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+                detail = f"aeroapi: {type(exc).__name__}: {exc}"
+                errors.append(detail)
+                note_provider("routes", False, detail)
+                confirmed = None
+            else:
+                # Cache the miss too. A number FlightAware has no live flight
+                # for will not sprout one in the next few minutes, and each
+                # ask costs real money.
+                route_cache.set(f"aero:{focus}", confirmed or False, ttl=AEROAPI_TTL)
+                if confirmed:
+                    note_provider("routes", True, "aeroapi resolved 1")
+        else:
+            confirmed = cached or None
+        if confirmed:
+            out[focus] = confirmed
 
     for plane in planes:
         callsign = (plane.get("callsign") or "").strip().upper()
@@ -591,6 +786,8 @@ def get_routes(planes: list) -> dict:
         if lon is None:
             lon = to_number(plane.get("lon"))
         positions[callsign] = (lat, lon)
+        if callsign in out:
+            continue  # FlightAware already answered; nothing can improve on it
 
         cached = route_cache.get(callsign)
         if cached is not None:
@@ -657,11 +854,48 @@ def get_routes(planes: list) -> dict:
     for callsign, entry in list(out.items()):
         if not entry or entry.get("suspect"):
             continue
+        if entry.get("source") == "aeroapi":
+            # Checked against nothing: this one names today's flight, and an
+            # aircraft holding or being vectored is still on that flight.
+            continue
         lat, lon = positions.get(callsign, (None, None))
         if not route_is_plausible(entry, lat, lon):
             out[callsign] = {**entry, "suspect": True}
 
-    return {"routes": out, "errors": errors}
+    return {"routes": out, "derived": derive(planes, focus), "errors": errors}
+
+
+def derive(planes: list, focus: str | None = None) -> dict:
+    """What each aircraft says about itself, independent of any route table.
+
+    Destination comes from the descent and costs nothing, so every aircraft
+    gets one. Origin needs the aircraft's track history pulled over the wire,
+    which is a few hundred KB, so only the focused aircraft is worth it.
+    """
+    focus = (focus or "").strip().upper() or None
+    out = {}
+    for plane in planes:
+        hex_id = (plane.get("hex") or "").strip().lower()
+        if not hex_id:
+            continue
+        # The board speaks `lng`; the readsb dialect everything else in this
+        # file uses says `lon`. Normalise once here rather than teaching the
+        # inference two spellings.
+        plane = dict(plane)
+        if plane.get("lon") is None:
+            plane["lon"] = plane.get("lng")
+        profile = airports.descent_profile(plane)
+        entry = {
+            "phase": profile["phase"],
+            "altitude": profile["altitude"],
+            "rate": profile["rate"],
+            "destination": airports.infer_destination(plane),
+            "origin": None,
+        }
+        if focus and (plane.get("callsign") or "").strip().upper() == focus:
+            entry["origin"] = airports.origin_from_trace(hex_id)
+        out[hex_id] = entry
+    return out
 
 
 # --------------------------------------------------------------- http serving
@@ -829,10 +1063,13 @@ class Handler(BaseHTTPRequestHandler):
             planes = payload.get("planes") or []
             if not isinstance(planes, list):
                 raise ValueError("planes must be a list")
+            focus = payload.get("focus")
+            if focus is not None and not isinstance(focus, str):
+                raise ValueError("focus must be a string")
         except ValueError as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
-        self.send_json(get_routes(planes[:200]))
+        self.send_json(get_routes(planes[:200], focus))
 
 
 # ----------------------------------------------------------------- entrypoint

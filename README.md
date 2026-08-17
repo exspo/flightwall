@@ -127,21 +127,60 @@ Positions come from volunteer ADS-B receivers, tried in order until one answers:
 readsb/tar1090 format, so any one of them can be down without you noticing.
 
 Routes (`ORD-LAX`) are a separate lookup — aircraft do not broadcast where they
-are going. Those come from adsb.lol's route database, falling back to
-adsbdb.com, cached for a day.
+are going. Three sources answer, in descending order of how much they can be
+trusted.
 
-Those databases are keyed on flight number and go stale, and for regional
-carriers they are wrong often enough to matter: a retired or reused number
-keeps its old airports and reads as fact. So every record is checked against
-the aircraft's own broadcast position — if the aircraft is nowhere near the
-claimed path, the route is withheld and the panel says which record it
-distrusted. Multi-leg routes are checked leg by leg, and the tolerance is
-generous, since real flights hold and get vectored around weather.
+**FlightAware**, if you have set up a key. This is the only source that knows
+what today's date is, so its answer is used as given and never second-guessed.
+It costs a query, so it is asked about one aircraft at a time — whichever the
+board is currently showing — and the answer is cached for six hours. Without a
+key this tier is simply skipped; nothing else changes.
 
-This makes wrong routes stop appearing; it does not make routes correct. For
-genuinely reliable routes and times you would need a commercial flight-data
-API with an account and a key — a different shape of project from a
-self-hosted board with no accounts in it.
+**The community route tables** — adsbdb.com and the VRS standing data behind
+adsb.lol — which are free and cost nothing to ask. They are also a flight
+number mapped to whatever that number meant on the day the table was built,
+with no date attached, so a reassigned number keeps its old airports
+indefinitely. Sampling 70 aircraft overhead in August 2026: adsbdb answered for
+38 of them and 27 of those 38 were contradicted by where the aircraft actually
+was. The same callsign frequently resolves to three different routes depending
+which table you ask.
+
+So every table record is checked against the aircraft's own broadcast position.
+If the aircraft is nowhere near the claimed path the route is withheld.
+Multi-leg routes are checked leg by leg, and the tolerance is generous, since
+real flights hold and get vectored around weather.
+
+**The aircraft itself**, which cannot go stale because it is an observation
+rather than a record. Its 24 hours of track history is rewound to the last time
+it was on the ground, which gives the airport it actually departed from. Its
+descent rate, groundspeed and track are projected forward to a patch of ground,
+which usually contains exactly one airport — that is where it is going. The
+autopilot's selected altitude distinguishes an aircraft levelled off mid-descent
+from one that is genuinely cruising.
+
+The second answer is only offered while an aircraft is low enough for it to
+mean something. At cruise an aeroplane looks identical whether it is stopping at
+the next field or carrying on for another two thousand miles, so nothing is
+said. Origin lookups pull a few hundred KB of track history and so are made
+only for the aircraft on screen.
+
+When none of the three can name an airport, the panel says what the aircraft is
+doing instead — `Descending through 6,000 ft, 6.2MI SSE` — rather than
+explaining which record it distrusted.
+
+### FlightAware key (optional)
+
+[AeroAPI's Personal tier](https://www.flightaware.com/commercial/aeroapi/) is
+free up to $5/month of usage, $10/month if you feed ADS-B. Because only the
+focused aircraft is ever looked up and answers are cached, that allowance goes
+a long way. Put the key in either place:
+
+```bash
+export FLIGHTWALL_AEROAPI_KEY=...
+```
+
+or add `"aeroapi_key": "..."` to `~/.flightwall/config.json`, which is already
+chmod 600.
 
 Map features are clipped to the current view on the laptop and sent as
 distances and bearings, so a view costs a few kilobytes rather than the 2.4 MB
@@ -179,7 +218,9 @@ and only when you tap it.
 - **Low-altitude traffic far from a receiver.** Coverage comes from volunteers
   with antennas. It is excellent above a few thousand feet near cities and
   patchy at low level in rural areas.
-- **Routes for private flights.** There is no route to look up.
+- **Filed routes for private flights.** No table carries a tail number, so
+  there is nothing to look up. The departure airport still resolves from the
+  aircraft's track history, and the arrival from its descent.
 - **Anything, if the laptop is asleep.** The phone is a window onto that
   machine; if it is off, the board is dark.
 
